@@ -1,7 +1,10 @@
 use crate::adapter::{ArticleData, IssueData, MagazineAdapter};
 use crate::progress::Progress;
+use crate::validation::absolutize;
 use scraper::{Html, Selector};
 use std::collections::HashSet;
+
+const BASE: &str = "https://harpers.org";
 
 pub struct HarpersAdapter;
 
@@ -27,7 +30,7 @@ impl MagazineAdapter for HarpersAdapter {
                         let parts: Vec<&str> = href.trim_matches('/').split('/').collect();
                         parts.len() >= 4 && parts.first() == Some(&"archive")
                     })
-                    .map(|href| format!("https://harpers.org{}", href))
+                    .map(|href| absolutize(BASE, href))
             })
             .collect();
 
@@ -63,7 +66,7 @@ impl MagazineAdapter for HarpersAdapter {
                 });
 
             if let Some(href) = href_opt {
-                let url = format!("https://harpers.org{}", href);
+                let url = absolutize(BASE, href);
                 if seen.insert(url.clone()) {
                     links.push(url);
                 }
@@ -76,6 +79,16 @@ impl MagazineAdapter for HarpersAdapter {
                     if seen.insert(r_url.clone()) {
                         links.push(r_url.clone());
                     }
+                }
+            }
+        }
+
+        // Fallback: if the issue had no Harper's Index card, the Readings links were
+        // never inserted above — append them so they aren't silently dropped.
+        if !readings_inserted {
+            for r_url in &reading_links {
+                if seen.insert(r_url.clone()) {
+                    links.push(r_url.clone());
                 }
             }
         }
@@ -103,10 +116,15 @@ impl MagazineAdapter for HarpersAdapter {
         progress.verbose(&format!("Issue title: {}", title));
         progress.verbose(&format!("Cover image: {}", cover_image_uri));
 
+        let cover_image_uri = if cover_image_uri.is_empty() {
+            cover_image_uri
+        } else {
+            absolutize(BASE, &cover_image_uri)
+        };
+
         IssueData {
             links,
             title,
-            css: String::new(),
             cover_image_uri,
             publication_name: "Harper's Magazine".to_string(),
         }
@@ -124,9 +142,13 @@ impl MagazineAdapter for HarpersAdapter {
             .map(|el| el.text().collect::<String>().trim().to_string())
             .filter(|t| !t.is_empty())
             .or_else(|| {
-                doc.select(&fallback_title_selector)
-                    .next()
-                    .map(|el| el.text().collect::<String>())
+                doc.select(&fallback_title_selector).next().map(|el| {
+                    let t = el.text().collect::<String>();
+                    // "Some Article | Harper's Magazine" → "Some Article"
+                    t.split_once(" | ")
+                        .map(|(head, _)| head.trim().to_string())
+                        .unwrap_or_else(|| t.trim().to_string())
+                })
             })
             .unwrap_or_else(|| "Untitled".into());
 
@@ -146,7 +168,11 @@ impl MagazineAdapter for HarpersAdapter {
 
         progress.verbose(&format!("Extracted: {}", title));
 
-        ArticleData { title, body }
+        ArticleData {
+            title,
+            byline: None,
+            body,
+        }
     }
 }
 

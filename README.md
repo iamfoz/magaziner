@@ -17,7 +17,16 @@ Magazine websites are noisy, require a live internet connection, and often restr
 ## Features
 
 - Generates a complete EPUB from a single issue URL
-- Fetches the cover image and embeds it
+- Fetches the real cover image (resolving lazy-loaded, relative URLs) and embeds it with the correct MIME type
+- Embeds in-article images as EPUB resources rather than stripping them
+- Ships a curated, e-reader-optimised stylesheet — clean typography, styled block quotes, reviewed-items, bylines, and figures — instead of dumping the website's own CSS
+- **Automated `--all` mode**: discovers LRB issues from the archive and downloads any not already fetched
+- **Download history**: records every downloaded issue and skips re-downloads unless `--force`
+- **Concurrent article downloads** with a configurable worker count (`--concurrency`)
+- A smooth in-place progress bar
+- Robust fetching: browser User-Agent, request timeouts, HTTP-error detection, and automatic retry with exponential backoff
+- Skips (rather than aborts on) an individual article that fails to download
+- Valid, well-formed XHTML output: text is XML-escaped, void elements self-closed, scripts/iframes stripped
 - Builds a linked table of contents
 - Configurable per-request delay for polite rate limiting
 - Verbose and quiet output modes for scripting
@@ -59,17 +68,56 @@ cp target/release/magaziner ~/.local/bin/
 ## Usage
 
 ```
-magaziner --url <URL> [OPTIONS]
+magaziner [OPTIONS]
 
 Options:
-  -u, --url <URL>        Magazine archive URL (LRB or Harper's)
-  -o, --output <OUTPUT>  Output directory for generated EPUBs [default: .]
-  -d, --delay <DELAY>    Delay between requests in milliseconds [default: 3000]
-  -f, --force            Overwrite the output file if it already exists
-  -v, --verbose          Print detailed network and parsing logs
-  -q, --quiet            Suppress all output (for scripting)
-  -h, --help             Print help
-  -V, --version          Print version
+  -u, --url <URL>                  Magazine archive URL (LRB or Harper's)
+      --all                        Download every LRB issue not already in the history file
+      --list                       With --all: list the issues that would be downloaded, then exit
+  -o, --output <OUTPUT>            Output directory for generated EPUBs [default: .]
+      --history <HISTORY>          Path to the download-history file [default: <output>/.magaziner-history.json]
+  -d, --delay <DELAY>              Delay before each request, in milliseconds [default: 3000]
+  -c, --concurrency <CONCURRENCY>  Number of concurrent article downloads [default: 4]
+  -f, --force                      Re-download even if the issue is already in the history
+  -v, --verbose                    Print detailed network and parsing logs
+  -q, --quiet                      Suppress all output (for scripting)
+  -n, --name <NAME>                Custom output filename without extension (single-issue mode)
+  -h, --help                       Print help
+  -V, --version                    Print version
+```
+
+Either `--url` or `--all` is required.
+
+### Automated mode & history
+
+`--all` discovers issues from the LRB archive index and downloads every one that is not
+already recorded in the history file:
+
+```bash
+magaziner --all --output ~/Books
+```
+
+Each successful download is recorded in `~/Books/.magaziner-history.json` (override with
+`--history`). On the next run, issues already in the history are skipped, so `--all` only
+fetches what's new. Use `--force` to re-download regardless of history, or `--list` to see
+which issues *would* be downloaded without fetching anything:
+
+```bash
+magaziner --all --list          # dry run
+magaziner --all --force         # re-download everything discovered
+```
+
+> Discovery reads the issues linked from the archive index page. To backfill a specific
+> older issue that isn't linked there, download it directly by URL.
+
+### Concurrency
+
+After the issue's table of contents is fetched, articles are downloaded concurrently. Tune
+the number of simultaneous requests with `--concurrency` (default `4`); each request still
+waits `--delay` milliseconds first, to stay polite to the source:
+
+```bash
+magaziner --url https://www.lrb.co.uk/the-paper/v48/n01 --concurrency 6 --delay 2000
 ```
 
 ### London Review of Books
@@ -162,34 +210,48 @@ The EPUB includes:
 
 ```
 src/
-├── main.rs                   # CLI args (clap), pipeline orchestration
+├── main.rs                   # CLI args (clap), single-issue + --all pipeline
 ├── adapter.rs                # MagazineAdapter trait + IssueData/ArticleData structs
-├── london_review_adapter.rs  # LRB HTML parsing
+├── london_review_adapter.rs  # LRB HTML parsing + archive discovery
 ├── harpers_adapter.rs        # Harper's HTML parsing
-├── fetch.rs                  # HTTP client (reqwest blocking), cookie injection
-├── epub.rs                   # EPUB assembly (epub-builder), HTML sanitization
-├── validation.rs             # URL regex validation, MagazineSource detection
-└── progress.rs               # Progress output (normal / verbose / quiet)
+├── fetch.rs                  # HTTP client, retry/backoff, concurrent article fetch
+├── epub.rs                   # EPUB assembly, DOM→XHTML serialization, image embedding
+├── style.rs                  # Curated e-reader stylesheet (embedded constant)
+├── history.rs                # Download-history store (atomic JSON)
+├── validation.rs             # URL validation, source detection, URL helpers
+└── progress.rs               # Progress output + in-place progress bar
 ```
 
 ### Pipeline
 
-1. **Validate URL** — regex match determines which adapter to use
-2. **Build HTTP client** — `reqwest::blocking::Client` with optional `Cookie` header
-3. **Fetch issue page** — parse article links, title, CSS, and cover image URL
-4. **Fetch each article** — extract title and body HTML, respecting the configured delay
-5. **Build EPUB** — sanitize HTML for XHTML compliance, assemble with cover and TOC
+1. **Resolve targets** — a single validated `--url`, or (`--all`) issue URLs discovered from
+   the LRB archive index, filtered against the download history
+2. **Build HTTP client** — `reqwest::blocking::Client` with a browser User-Agent, timeout,
+   and optional `Cookie` header
+3. **Fetch issue page** — parse article links, title, and the (absolutized) cover image URL
+4. **Fetch articles concurrently** — bounded worker pool, retry with backoff, per-request
+   delay; a failed article is skipped, not fatal
+5. **Build EPUB** — re-serialize each article body from a parsed DOM into valid XHTML,
+   embed the cover and in-article images, apply the curated stylesheet, assemble with TOC,
+   and write atomically
+6. **Record history** — append the issue to the history file so it isn't re-downloaded
 
 ### Adding a new publication
 
 Implement `MagazineAdapter` for your new source:
 
 ```rust
-pub trait MagazineAdapter {
+pub trait MagazineAdapter: Sync {
     fn extract_issue(&self, doc: &Html, progress: &Progress) -> IssueData;
     fn extract_article(&self, doc: &Html, progress: &Progress) -> ArticleData;
+
+    // Optional: parse an archive listing into issue URLs for `--all`.
+    // Defaults to returning no issues.
+    fn discover_issues(&self, doc: &Html, progress: &Progress) -> Vec<String> { Vec::new() }
 }
 ```
+
+(The `Sync` bound lets a single stateless adapter drive concurrent article fetches.)
 
 Then add a regex branch to `detect_source()` in `validation.rs` and wire up the adapter in `main.rs`. No other files need to change.
 
@@ -243,8 +305,11 @@ src/test/
 | [`reqwest`](https://crates.io/crates/reqwest) | Blocking HTTP client |
 | [`scraper`](https://crates.io/crates/scraper) | HTML parsing via CSS selectors |
 | [`epub-builder`](https://crates.io/crates/epub-builder) | EPUB file generation |
+| [`ego-tree`](https://crates.io/crates/ego-tree) | DOM traversal for XHTML re-serialization |
 | [`regex`](https://crates.io/crates/regex) | URL validation |
-| [`url`](https://crates.io/crates/url) | URL parsing |
+| [`url`](https://crates.io/crates/url) | URL parsing and resolution |
+| [`serde`](https://crates.io/crates/serde) + [`serde_json`](https://crates.io/crates/serde_json) | Download-history serialization |
+| [`chrono`](https://crates.io/crates/chrono) | History timestamps |
 | [`anyhow`](https://crates.io/crates/anyhow) | Ergonomic error handling |
 
 ---

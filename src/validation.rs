@@ -33,6 +33,40 @@ pub fn validate_magazine_url(s: &str) -> Result<String, String> {
     }
 }
 
+/// Resolve a possibly-relative `href` against `base`, returning an absolute URL.
+/// Handles root-relative (`/a/b`), protocol-relative (`//host/x`), and already-absolute
+/// URLs correctly. Falls back to the raw `href` if resolution fails.
+pub fn absolutize(base: &str, href: &str) -> String {
+    let href = href.trim();
+    match Url::parse(base).and_then(|b| b.join(href)) {
+        Ok(u) => u.to_string(),
+        Err(_) => href.to_string(),
+    }
+}
+
+/// Extract a canonical, stable issue identifier from an issue URL, used as the key in
+/// the download history. LRB → `"v48/n01"`, Harper's → `"2026/02"`.
+pub fn issue_id_from_url(url: &str) -> Option<String> {
+    match detect_source(url)? {
+        MagazineSource::LondonReview => {
+            let re = Regex::new(r"/the-paper/(v\d{2}/n\d{2})/?$").unwrap();
+            re.captures(url).map(|c| c[1].to_string())
+        }
+        MagazineSource::Harpers => {
+            let re = Regex::new(r"/archive/(\d{4}/\d{2})/?$").unwrap();
+            re.captures(url).map(|c| c[1].to_string())
+        }
+    }
+}
+
+/// A short code for each source, used as the history `source` field and filename prefix.
+pub fn source_code(source: &MagazineSource) -> &'static str {
+    match source {
+        MagazineSource::LondonReview => "LRB",
+        MagazineSource::Harpers => "Harpers",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +145,45 @@ mod tests {
     #[test]
     fn test_detect_unknown_returns_none() {
         assert_eq!(detect_source("https://example.com"), None);
+    }
+
+    #[test]
+    fn test_absolutize_root_relative() {
+        assert_eq!(
+            absolutize("https://www.lrb.co.uk/the-paper/v48/n01", "/storage/cover.jpg"),
+            "https://www.lrb.co.uk/storage/cover.jpg"
+        );
+    }
+
+    #[test]
+    fn test_absolutize_protocol_relative() {
+        assert_eq!(
+            absolutize("https://www.lrb.co.uk/the-paper/v48/n01", "//img.lrb.co.uk/c.jpg"),
+            "https://img.lrb.co.uk/c.jpg"
+        );
+    }
+
+    #[test]
+    fn test_absolutize_already_absolute() {
+        assert_eq!(
+            absolutize("https://www.lrb.co.uk/x", "https://cdn.example.com/c.jpg"),
+            "https://cdn.example.com/c.jpg"
+        );
+    }
+
+    #[test]
+    fn test_issue_id_from_lrb_url() {
+        assert_eq!(
+            issue_id_from_url("https://www.lrb.co.uk/the-paper/v48/n01"),
+            Some("v48/n01".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_id_from_harpers_url() {
+        assert_eq!(
+            issue_id_from_url("https://harpers.org/archive/2026/02"),
+            Some("2026/02".to_string())
+        );
     }
 }

@@ -909,11 +909,15 @@ name = "magaziner"
 version = "0.1.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "ego-tree",
  "epub-builder",
  "regex",
  "reqwest",
  "scraper",
+ "serde",
+ "serde_json",
  "url",
 ]
 

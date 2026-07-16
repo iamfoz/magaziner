@@ -2,26 +2,35 @@ mod adapter;
 mod epub;
 mod fetch;
 mod harpers_adapter;
+mod history;
 mod london_review_adapter;
 mod progress;
+mod style;
 mod validation;
 
 use adapter::MagazineAdapter;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
 use epub::build_epub;
-use fetch::{fetch_html_body, make_client};
+use fetch::{fetch_articles, fetch_html_body, make_client};
 use harpers_adapter::HarpersAdapter;
+use history::{History, HistoryEntry};
 use london_review_adapter::LondonReviewAdapter;
 use progress::{Progress, Verbosity};
-use std::path::PathBuf;
-use validation::{MagazineSource, detect_source, validate_magazine_url};
+use reqwest::blocking::Client;
+use std::path::{Path, PathBuf};
+use validation::{
+    MagazineSource, detect_source, issue_id_from_url, source_code, validate_magazine_url,
+};
+
+/// Default archive listing page used by `--all` to discover LRB issues.
+const LRB_ARCHIVE_URL: &str = "https://www.lrb.co.uk/the-paper";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "magaziner",
     version,
-    about = "Generate epub files from Magazine archives",
+    about = "Generate EPUB files from magazine archives (London Review of Books, Harper's)",
     long_about = None
 )]
 struct Args {
@@ -29,9 +38,24 @@ struct Args {
         short,
         long,
         value_parser = validate_magazine_url,
+        required_unless_present = "all",
         help = "Magazine archive URL (LRB or Harper's)"
     )]
-    url: String,
+    url: Option<String>,
+
+    #[arg(
+        long,
+        help = "Download every LRB issue not already in the history file",
+        default_value_t = false
+    )]
+    all: bool,
+
+    #[arg(
+        long,
+        help = "With --all: list the issues that would be downloaded, then exit",
+        default_value_t = false
+    )]
+    list: bool,
 
     #[arg(
         long,
@@ -42,9 +66,15 @@ struct Args {
     output: PathBuf,
 
     #[arg(
+        long,
+        help = "Path to the download-history file [default: <output>/.magaziner-history.json]"
+    )]
+    history: Option<PathBuf>,
+
+    #[arg(
         short,
         long,
-        help = "Delay between calls to magazine source in milliseconds (ex: 1000 = 1 second)",
+        help = "Delay before each request, in milliseconds",
         default_value_t = 3000
     )]
     delay: u64,
@@ -52,41 +82,41 @@ struct Args {
     #[arg(
         short,
         long,
-        help = "Overwrite the output file if it already exists",
+        help = "Number of concurrent article downloads",
+        default_value_t = 4
+    )]
+    concurrency: usize,
+
+    #[arg(
+        short,
+        long,
+        help = "Re-download and overwrite even if the issue is already in the history",
         default_value_t = false
     )]
     force: bool,
 
-    #[arg(
-        short,
-        long,
-        help = "Print detailed network and parsing logs",
-        conflicts_with = "quiet"
-    )]
+    #[arg(short, long, help = "Print detailed logs", conflicts_with = "quiet")]
     verbose: bool,
 
-    #[arg(
-        short,
-        long,
-        help = "Suppress all output for script automation",
-        conflicts_with = "verbose"
-    )]
+    #[arg(short, long, help = "Suppress all output", conflicts_with = "verbose")]
     quiet: bool,
 
     #[arg(
         short,
         long,
-        help = "Custom output filename without extension (ex: --name \"My Issue\")"
+        help = "Custom output filename without extension (single-issue mode only)"
     )]
     name: Option<String>,
 }
 
+/// The result of attempting one issue.
+enum Outcome {
+    Downloaded,
+    Skipped,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let url = args.url;
-    let output = args.output;
-    let delay = args.delay;
-    let force = args.force;
 
     let verbosity = if args.verbose {
         Verbosity::Verbose
@@ -95,78 +125,282 @@ fn main() -> Result<()> {
     } else {
         Verbosity::Normal
     };
+    let progress = Progress::new(verbosity);
 
-    let mut progress = Progress::new(verbosity);
-
-    let source = detect_source(&url).expect("URL already validated by clap");
-
-    // HARPERS_COOKIE should be set to the raw Cookie header value from an authenticated
-    // browser session (e.g. "wordpress_logged_in_xxx=abc123; other_cookie=value").
-    let harpers_cookie = std::env::var("HARPERS_COOKIE").ok();
-    if matches!(source, MagazineSource::Harpers) && harpers_cookie.is_none() {
-        eprintln!(
-            "Warning: HARPERS_COOKIE env var not set; subscriber content may be inaccessible."
-        );
+    if !args.output.exists() {
+        std::fs::create_dir_all(&args.output)?;
     }
 
-    let cookie = match source {
-        MagazineSource::Harpers => harpers_cookie.as_deref(),
-        MagazineSource::LondonReview => None,
-    };
+    let history_path = args
+        .history
+        .clone()
+        .unwrap_or_else(|| args.output.join(".magaziner-history.json"));
+    let mut history = History::load(&history_path)?;
 
-    let client = make_client(cookie)?;
+    if args.all {
+        run_all(&args, &progress, &mut history, &history_path)
+    } else {
+        run_single(&args, &progress, &mut history, &history_path)
+    }
+}
+
+/// Single-issue mode: download the one issue named by `--url`.
+fn run_single(
+    args: &Args,
+    progress: &Progress,
+    history: &mut History,
+    history_path: &Path,
+) -> Result<()> {
+    let url = args.url.as_ref().expect("clap enforces url unless --all");
+    let source = detect_source(url).expect("URL already validated by clap");
+
+    let cookie = harpers_cookie_for(&source);
+    let client = make_client(cookie.as_deref())?;
+
+    match process_issue(url, args.name.clone(), &source, &client, args, progress, history, history_path)? {
+        Outcome::Downloaded => {}
+        Outcome::Skipped => {
+            progress.info("Already downloaded. Use --force to re-download.");
+        }
+    }
+    Ok(())
+}
+
+/// Automated mode: discover LRB issues and download those not yet in the history.
+fn run_all(
+    args: &Args,
+    progress: &Progress,
+    history: &mut History,
+    history_path: &Path,
+) -> Result<()> {
+    if args.name.is_some() {
+        progress.warn("--name is ignored in --all mode; filenames are derived per issue.");
+    }
+
+    let source = MagazineSource::LondonReview;
+    let client = make_client(None)?;
+    let adapter = LondonReviewAdapter;
+
+    progress.step(&format!("Discovering issues from {}…", LRB_ARCHIVE_URL));
+    let doc = fetch_html_body(&client, LRB_ARCHIVE_URL, &args.delay, progress)?;
+    let issues = adapter.discover_issues(&doc, progress);
+
+    if issues.is_empty() {
+        bail!("No issues found on the archive page. The site markup may have changed.");
+    }
+
+    let pending: Vec<&String> = issues
+        .iter()
+        .filter(|url| {
+            let id = issue_id_from_url(url).unwrap_or_else(|| (*url).clone());
+            issue_pending(args, history, source_code(&source), &id)
+        })
+        .collect();
+
+    progress.info(&format!(
+        "{} issues found, {} to download ({} already in history).",
+        issues.len(),
+        pending.len(),
+        issues.len() - pending.len()
+    ));
+
+    if args.list {
+        for url in &pending {
+            println!("{}", url);
+        }
+        return Ok(());
+    }
+
+    let (mut downloaded, mut skipped, mut failed) = (0u32, 0u32, 0u32);
+    for url in pending {
+        progress.step(&format!("Issue {}", url));
+        match process_issue(url, None, &source, &client, args, progress, history, history_path) {
+            Ok(Outcome::Downloaded) => downloaded += 1,
+            Ok(Outcome::Skipped) => skipped += 1,
+            Err(e) => {
+                failed += 1;
+                progress.warn(&format!("Failed to download {}: {:#}", url, e));
+            }
+        }
+    }
+
+    progress.step(&format!(
+        "Done. {} downloaded, {} skipped, {} failed.",
+        downloaded, skipped, failed
+    ));
+    Ok(())
+}
+
+/// Download and build one issue, updating the history on success.
+#[allow(clippy::too_many_arguments)]
+fn process_issue(
+    url: &str,
+    name_override: Option<String>,
+    source: &MagazineSource,
+    client: &Client,
+    args: &Args,
+    progress: &Progress,
+    history: &mut History,
+    history_path: &Path,
+) -> Result<Outcome> {
+    let src_code = source_code(source);
+    let issue_id = issue_id_from_url(url).unwrap_or_else(|| url.to_string());
+
+    // Skip only if it's in history AND the file is still on disk (so a deleted EPUB is
+    // regenerated). --force overrides everything.
+    if !issue_pending(args, history, src_code, &issue_id) {
+        progress.verbose(&format!("Skipping {} (already downloaded)", issue_id));
+        return Ok(Outcome::Skipped);
+    }
 
     let adapter: Box<dyn MagazineAdapter> = match source {
         MagazineSource::LondonReview => Box::new(LondonReviewAdapter),
         MagazineSource::Harpers => Box::new(HarpersAdapter),
     };
 
-    if !output.exists() {
-        std::fs::create_dir_all(&output)?;
+    progress.step("Fetching issue contents…");
+    let doc = fetch_html_body(client, url, &args.delay, progress)?;
+    let issue = adapter.extract_issue(&doc, progress);
+
+    if issue.links.is_empty() {
+        bail!("No articles found for this issue; the site markup may have changed.");
     }
 
-    progress.next("Fetching issue HTML…");
-    let doc = fetch_html_body(&client, &url, &delay, &progress)?;
-    let issue = adapter.extract_issue(&doc, &progress);
+    let filename = name_override
+        .unwrap_or_else(|| format!("{} - {}", src_code, issue.title));
+    let filename = sanitize_filename(&filename);
+    let output_path = args.output.join(format!("{}.epub", filename));
 
-    let magazine_prefix = match source {
-        MagazineSource::Harpers => "Harpers",
-        MagazineSource::LondonReview => "LRB",
-    };
-    let filename = args
-        .name
-        .unwrap_or_else(|| format!("{} - {}", magazine_prefix, issue.title));
-
-    let output_path = output.join(format!("{}.epub", filename));
-    if output_path.exists() && !force {
-        return Err(anyhow::anyhow!(
-            "File '{}' already exists. Use --force to overwrite.",
-            output_path.display()
-        ));
+    if !args.force && output_path.exists() {
+        progress.info(&format!("{} already exists; skipping.", output_path.display()));
+        // Record it so the history reflects reality on the next run.
+        persist_download(
+            history_path,
+            history,
+            HistoryEntry::now(src_code, &issue_id, &issue.title, format!("{}.epub", filename)),
+        )?;
+        return Ok(Outcome::Skipped);
     }
 
-    let article_length = issue.links.len();
-    progress.next(&format!("Extracting {} articles…", article_length));
+    progress.step(&format!(
+        "Fetching {} articles ({} at a time)…",
+        issue.links.len(),
+        args.concurrency
+    ));
+    let articles = fetch_articles(
+        client,
+        &issue.links,
+        args.delay,
+        args.concurrency,
+        progress,
+        |d| adapter.extract_article(d, progress),
+    );
 
-    let mut articles = Vec::new();
-    for (i, link) in issue.links.iter().enumerate() {
-        progress.substep(i, article_length);
-        let article_doc = fetch_html_body(&client, link, &delay, &progress)?;
-        let article = adapter.extract_article(&article_doc, &progress);
-        articles.push((article.title, article.body));
+    if articles.is_empty() {
+        bail!("Every article failed to download for this issue.");
     }
 
     build_epub(
-        &mut progress,
+        progress,
         &issue.title,
         &issue.publication_name,
-        &filename,
-        &output,
+        &output_path,
         articles,
-        &issue.css,
         &issue.cover_image_uri,
-        &client,
+        client,
+        url,
     )?;
 
+    persist_download(
+        history_path,
+        history,
+        HistoryEntry::now(src_code, &issue_id, &issue.title, format!("{}.epub", filename)),
+    )?;
+
+    Ok(Outcome::Downloaded)
+}
+
+/// Whether an issue still needs downloading: forced, absent from history, or its recorded
+/// EPUB file has since been deleted from the output directory.
+fn issue_pending(args: &Args, history: &History, src_code: &str, issue_id: &str) -> bool {
+    if args.force {
+        return true;
+    }
+    match history.get(src_code, issue_id) {
+        Some(entry) => !args.output.join(&entry.filename).exists(),
+        None => true,
+    }
+}
+
+/// Record a completed download and persist it, merging with the on-disk history first so a
+/// concurrent run's entries aren't clobbered. Keeps the in-memory history in sync with disk.
+fn persist_download(path: &Path, history: &mut History, entry: HistoryEntry) -> Result<()> {
+    let mut disk = History::load(path).unwrap_or_default();
+    disk.record(entry);
+    disk.save(path)?;
+    *history = disk;
     Ok(())
+}
+
+fn harpers_cookie_for(source: &MagazineSource) -> Option<String> {
+    if !matches!(source, MagazineSource::Harpers) {
+        return None;
+    }
+    // HARPERS_COOKIE is the raw Cookie header value from an authenticated browser session.
+    match std::env::var("HARPERS_COOKIE") {
+        Ok(c) if !c.is_empty() => Some(c),
+        _ => {
+            eprintln!(
+                "Warning: HARPERS_COOKIE env var not set; subscriber content may be inaccessible."
+            );
+            None
+        }
+    }
+}
+
+/// Make a title safe to use as a filename across common filesystems.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '-',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "issue".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_filename;
+
+    #[test]
+    fn test_sanitize_strips_path_separators() {
+        assert_eq!(sanitize_filename("a/b\\c"), "a-b-c");
+    }
+
+    #[test]
+    fn test_sanitize_keeps_interpunct() {
+        assert_eq!(
+            sanitize_filename("Vol. 48 No. 1 · 2 January 2026"),
+            "Vol. 48 No. 1 · 2 January 2026"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_traversal() {
+        // No path separators survive, so join() can't escape the output directory.
+        assert!(!sanitize_filename("../../etc/passwd").contains('/'));
+    }
+
+    #[test]
+    fn test_sanitize_empty_fallback() {
+        assert_eq!(sanitize_filename("   "), "issue");
+    }
 }
