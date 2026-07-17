@@ -12,7 +12,6 @@ impl MagazineAdapter for LondonReviewAdapter {
     fn extract_issue(&self, doc: &Html, progress: &Progress) -> IssueData {
         let articles_selector = Selector::parse("a.toc-item").unwrap();
         let title_selector = Selector::parse("title").unwrap();
-        let cover_selector = Selector::parse("div.article-issue-cover-image img").unwrap();
 
         let links: Vec<String> = doc
             .select(&articles_selector)
@@ -27,21 +26,7 @@ impl MagazineAdapter for LondonReviewAdapter {
             .map(|t| clean_issue_title(&t))
             .unwrap_or_else(|| "Untitled".into());
 
-        // Prefer the full-resolution lazy-load source; fall back to srcset then src.
-        // Resolve to an absolute URL so relative `/storage/...` paths still download.
-        let cover_image_uri = doc
-            .select(&cover_selector)
-            .next()
-            .and_then(|img| {
-                img.value()
-                    .attr("data-appsrc")
-                    .or_else(|| img.value().attr("srcset"))
-                    .or_else(|| img.value().attr("src"))
-            })
-            .map(|url| url.split_whitespace().next().unwrap_or("").to_string())
-            .filter(|s| !s.is_empty())
-            .map(|s| absolutize(BASE, &s))
-            .unwrap_or_default();
+        let cover_image_uri = extract_cover_uri(doc);
 
         if cover_image_uri.is_empty() {
             progress.warn("No cover image found on the issue page.");
@@ -128,6 +113,73 @@ impl MagazineAdapter for LondonReviewAdapter {
     }
 }
 
+/// Extract the issue cover image URL, resolved to an absolute URL.
+///
+/// LRB markup has changed over time and cover images are lazy-loaded, so this tries a
+/// series of strategies in order of preference:
+///   1. A dedicated cover image element (several known container classes).
+///   2. The Open Graph `og:image` meta tag — on an LRB issue page this is the cover,
+///      and it's an absolute URL. This is the reliable fallback when the markup shifts.
+///   3. The Twitter card image.
+fn extract_cover_uri(doc: &Html) -> String {
+    const IMG_SELECTORS: &[&str] = &[
+        "div.article-issue-cover-image img",
+        "figure.issue-cover img",
+        ".issue-cover img",
+        "img.cover-image",
+        "img.issue-cover",
+    ];
+    for sel in IMG_SELECTORS {
+        if let Some(uri) = first_img_src(doc, sel) {
+            return absolutize(BASE, &uri);
+        }
+    }
+
+    const META_SELECTORS: &[&str] = &[
+        r#"meta[property="og:image"]"#,
+        r#"meta[name="og:image"]"#,
+        r#"meta[name="twitter:image"]"#,
+        r#"meta[name="twitter:image:src"]"#,
+    ];
+    for sel in META_SELECTORS {
+        if let Some(content) = meta_content(doc, sel) {
+            return absolutize(BASE, &content);
+        }
+    }
+
+    String::new()
+}
+
+/// The best src of the first element matching `selector`: prefer the full-resolution
+/// lazy-load attribute, then the first `srcset` candidate, then plain `src`.
+fn first_img_src(doc: &Html, selector: &str) -> Option<String> {
+    let sel = Selector::parse(selector).ok()?;
+    let img = doc.select(&sel).next()?;
+    let raw = img
+        .value()
+        .attr("data-appsrc")
+        .or_else(|| img.value().attr("data-src"))
+        .or_else(|| img.value().attr("srcset"))
+        .or_else(|| img.value().attr("src"))?;
+    // srcset is "url 600w, url2 1200w" — take the first URL token.
+    let first = raw.split(&[',', ' '][..]).next().unwrap_or("").trim();
+    if first.is_empty() {
+        None
+    } else {
+        Some(first.to_string())
+    }
+}
+
+/// The `content` attribute of the first element matching `selector`, if non-empty.
+fn meta_content(doc: &Html, selector: &str) -> Option<String> {
+    let sel = Selector::parse(selector).ok()?;
+    doc.select(&sel)
+        .next()
+        .and_then(|el| el.value().attr("content"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// "Contents · Vol. 99 No. 3 · 15 March 2025" → "Vol. 99 No. 3 · 15 March 2025".
 fn clean_issue_title(raw: &str) -> String {
     let t = raw.trim();
@@ -201,6 +253,51 @@ mod tests {
             issue.cover_image_uri,
             "https://www.lrb.co.uk/storage/2000_filter/images/4/0/1/9/cover.jpg"
         );
+    }
+
+    #[test]
+    fn test_cover_falls_back_to_og_image() {
+        // No dedicated cover element; must fall back to the og:image meta tag.
+        let html = r#"<html><head>
+            <meta property="og:image" content="https://www.lrb.co.uk/storage/covers/n01.jpg">
+        </head><body><a class="toc-item" href="/the-paper/v48/n01/a">x</a></body></html>"#;
+        let doc = Html::parse_document(html);
+        assert_eq!(
+            extract_cover_uri(&doc),
+            "https://www.lrb.co.uk/storage/covers/n01.jpg"
+        );
+    }
+
+    #[test]
+    fn test_cover_og_image_relative_is_absolutized() {
+        let html = r#"<html><head>
+            <meta property="og:image" content="/storage/covers/n01.jpg">
+        </head><body></body></html>"#;
+        let doc = Html::parse_document(html);
+        assert_eq!(
+            extract_cover_uri(&doc),
+            "https://www.lrb.co.uk/storage/covers/n01.jpg"
+        );
+    }
+
+    #[test]
+    fn test_cover_prefers_dedicated_element_over_meta() {
+        let html = r#"<html><head>
+            <meta property="og:image" content="/storage/social/fallback.jpg">
+        </head><body>
+            <div class="article-issue-cover-image"><img data-appsrc="/storage/covers/real.jpg"></div>
+        </body></html>"#;
+        let doc = Html::parse_document(html);
+        assert_eq!(
+            extract_cover_uri(&doc),
+            "https://www.lrb.co.uk/storage/covers/real.jpg"
+        );
+    }
+
+    #[test]
+    fn test_cover_absent_returns_empty() {
+        let doc = Html::parse_document("<html><head></head><body><p>no cover</p></body></html>");
+        assert_eq!(extract_cover_uri(&doc), "");
     }
 
     #[test]

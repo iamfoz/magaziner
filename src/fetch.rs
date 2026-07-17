@@ -2,7 +2,7 @@ use crate::adapter::ArticleData;
 use crate::progress::{Progress, ProgressBar};
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
-use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, REFERER, USER_AGENT};
 use scraper::Html;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,16 +61,22 @@ pub fn fetch_html_raw(
 }
 
 /// Download a URL as raw bytes, returning the bytes and a best-effort image MIME type.
-/// Retries transient failures with backoff.
+/// Retries transient failures with backoff. `referer`, when set, is sent as the
+/// `Referer` header — many sites hotlink-protect images and 403 requests without one.
 pub fn download_bytes(
     client: &Client,
     url: &str,
+    referer: Option<&str>,
     progress: &Progress,
 ) -> Result<(Vec<u8>, String)> {
     progress.verbose(&format!("Downloading asset: {}", url));
 
     with_retry(progress, url, || {
-        let resp = client.get(url).send()?.error_for_status()?;
+        let mut req = client.get(url);
+        if let Some(r) = referer {
+            req = req.header(REFERER, r);
+        }
+        let resp = req.send()?.error_for_status()?;
 
         let header_mime = resp
             .headers()

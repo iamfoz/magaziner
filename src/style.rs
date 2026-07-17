@@ -66,21 +66,21 @@ h2 + p,
 h3 + p,
 .article-title + p,
 .byline + p,
-.reviewed-items + p {
+.reviewed-items + p,
+.article-body > p:first-of-type {
   text-indent: 0;
 }
 
-/* A subtle, optional drop-cap for the article's opening paragraph. Many
-   reading systems ignore ::first-letter entirely, which is fine -- the
-   paragraph still reads correctly without it. */
-.article-title + p::first-letter,
-.byline + p::first-letter {
-  font-size: 2.4em;
-  line-height: 0.9;
+/* A subtle drop-cap for the article's opening paragraph only. `:first-of-type`
+   selects the first <p> child of the body, skipping any reviewed-items block, and
+   never matches the byline or title (which live outside .article-body). Many reading
+   systems ignore ::first-letter, which is fine -- the text still reads correctly. */
+.article-body > p:first-of-type::first-letter {
+  font-size: 1.9em;
+  line-height: 1;
   font-weight: bold;
   float: left;
-  padding-right: 0.08em;
-  padding-top: 0.02em;
+  padding-right: 0.06em;
 }
 
 /* ---------------------------------------------------------------------

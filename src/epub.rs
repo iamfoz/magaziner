@@ -59,7 +59,7 @@ pub fn build_epub(
     // Cover: download straight to memory (no temp file), detect the real MIME type.
     progress.step("Downloading cover…");
     if !cover_image_uri.trim().is_empty() && cover_image_uri.starts_with("http") {
-        match download_bytes(client, cover_image_uri, progress) {
+        match download_bytes(client, cover_image_uri, Some(base_url), progress) {
             Ok((bytes, mime)) => {
                 let cover_name = format!("cover.{}", ext_for_mime(&mime));
                 epub.add_cover_image(&cover_name, bytes.as_slice(), mime.as_str())?;
@@ -129,10 +129,14 @@ pub fn build_epub(
             .map(|b| format!("    <p class=\"byline\">By {}</p>\n", escape_text(b)))
             .unwrap_or_default();
 
+        // The body is wrapped in .article-body so styling (e.g. the drop cap) can target
+        // the first real article paragraph without ever touching the byline or title.
         let content = format!(
             r#"<body>
     <h1 class="article-title">{}</h1>
-{}    {}
+{}    <div class="article-body">
+    {}
+    </div>
   </body>"#,
             escape_text(&article.title),
             byline_html,
@@ -216,7 +220,7 @@ fn download_article_images(
             continue;
         }
         let abs = absolutize(base_url, src);
-        match download_bytes(client, &abs, progress) {
+        match download_bytes(client, &abs, Some(base_url), progress) {
             Ok((bytes, mime)) => {
                 let href = format!("images/a{}_{}.{}", article_idx, counter, ext_for_mime(&mime));
                 *counter += 1;
