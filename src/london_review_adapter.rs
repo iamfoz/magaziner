@@ -122,65 +122,87 @@ impl MagazineAdapter for LondonReviewAdapter {
 ///      and it's an absolute URL. This is the reliable fallback when the markup shifts.
 ///   3. The Twitter card image.
 fn extract_cover_uri(doc: &Html) -> String {
-    const IMG_SELECTORS: &[&str] = &[
+    const COVER_SELECTORS: &[&str] = &[
         "div.article-issue-cover-image img",
+        ".toc-cover img",
         "figure.issue-cover img",
         ".issue-cover img",
         "img.cover-image",
-        "img.issue-cover",
     ];
+
+    for sel in COVER_SELECTORS {
+        let Ok(selector) = Selector::parse(sel) else {
+            continue;
+        };
+        let Some(img) = doc.select(&selector).next() else {
+            continue;
+        };
+
+        // 1. Prefer the highest-resolution candidate from the responsive srcset. On LRB
+        //    this yields the full 2000-wide cover; the single-URL `data-appsrc` is a
+        //    JS placeholder ("//images/...") and `og:image` is a cropped social card.
+        if let Some(u) = best_from_srcset(&img)
+            && is_valid_http_url(&u)
+        {
+            return u;
+        }
+        // 2. Fall back to single-URL attributes on the same element.
+        if let Some(raw) = img
+            .value()
+            .attr("data-appsrc")
+            .or_else(|| img.value().attr("data-src"))
+            .or_else(|| img.value().attr("src"))
+        {
+            let abs = absolutize(BASE, raw.trim());
+            if is_valid_http_url(&abs) {
+                return abs;
+            }
+        }
+    }
+
+    // 3. Last resort: the social-image meta tag, rewritten from the cropped
+    //    `social_image_on_bg` variant to the full-size cover.
     const META_SELECTORS: &[&str] = &[
         r#"meta[property="og:image"]"#,
-        r#"meta[name="og:image"]"#,
         r#"meta[name="twitter:image"]"#,
-        r#"meta[name="twitter:image:src"]"#,
     ];
-
-    // Gather candidates in priority order: the dedicated cover element first, then the
-    // server-rendered social-image meta tags.
-    let mut candidates: Vec<String> = Vec::new();
-    for sel in IMG_SELECTORS {
-        if let Some(uri) = first_img_src(doc, sel) {
-            candidates.push(uri);
-        }
-    }
     for sel in META_SELECTORS {
         if let Some(content) = meta_content(doc, sel) {
-            candidates.push(content);
-        }
-    }
-
-    // Return the first candidate that resolves to a valid absolute URL. This skips mangled
-    // JS-placeholder img sources (e.g. `//images/...` → `https://images/...`) and falls
-    // through to the og:image meta tag, which on an LRB issue page is the cover.
-    for cand in &candidates {
-        let abs = absolutize(BASE, cand);
-        if is_valid_http_url(&abs) {
-            return abs;
+            let full = content.replace("/social_image_on_bg/", "/2000_filter/");
+            let abs = absolutize(BASE, &full);
+            if is_valid_http_url(&abs) {
+                return abs;
+            }
         }
     }
 
     String::new()
 }
 
-/// The best src of the first element matching `selector`: prefer the full-resolution
-/// lazy-load attribute, then the first `srcset` candidate, then plain `src`.
-fn first_img_src(doc: &Html, selector: &str) -> Option<String> {
-    let sel = Selector::parse(selector).ok()?;
-    let img = doc.select(&sel).next()?;
+/// Pick the largest-width URL from an element's `data-srcset`/`srcset`. A srcset entry is
+/// "url 1600w" (or "url 2x"); we parse the numeric descriptor and keep the biggest.
+fn best_from_srcset(img: &scraper::ElementRef<'_>) -> Option<String> {
     let raw = img
         .value()
-        .attr("data-appsrc")
-        .or_else(|| img.value().attr("data-src"))
-        .or_else(|| img.value().attr("srcset"))
-        .or_else(|| img.value().attr("src"))?;
-    // srcset is "url 600w, url2 1200w" — take the first URL token.
-    let first = raw.split(&[',', ' '][..]).next().unwrap_or("").trim();
-    if first.is_empty() {
-        None
-    } else {
-        Some(first.to_string())
+        .attr("data-srcset")
+        .or_else(|| img.value().attr("srcset"))?;
+
+    let mut best: Option<(u32, String)> = None;
+    for candidate in raw.split(',') {
+        let mut parts = candidate.split_whitespace();
+        let Some(url) = parts.next() else {
+            continue;
+        };
+        let width = parts
+            .next()
+            .map(|d| d.trim_end_matches(['w', 'x']))
+            .and_then(|d| d.parse::<u32>().ok())
+            .unwrap_or(0);
+        if best.as_ref().map(|(w, _)| width >= *w).unwrap_or(true) {
+            best = Some((width, url.to_string()));
+        }
     }
+    best.map(|(_, url)| absolutize(BASE, &url))
 }
 
 /// The `content` attribute of the first element matching `selector`, if non-empty.
@@ -257,14 +279,48 @@ mod tests {
     }
 
     #[test]
-    fn test_cover_uri_is_absolutized() {
+    fn test_cover_uri_picks_largest_srcset() {
         let doc = load_html_fixture("src/test/lrb/issue.html");
         let progress = Progress::new(Verbosity::Quiet);
         let issue = LondonReviewAdapter.extract_issue(&doc, &progress);
-        // data-appsrc is a relative /storage/... path; it must become absolute.
+        // The srcset has 400w and 1600w candidates; the largest (2000_filter) must win,
+        // not the broken `//images/...` data-appsrc placeholder.
         assert_eq!(
             issue.cover_image_uri,
             "https://www.lrb.co.uk/storage/2000_filter/images/4/0/1/9/cover.jpg"
+        );
+    }
+
+    #[test]
+    fn test_cover_real_lrb_markup() {
+        // The exact structure from a live LRB issue page: broken //images placeholder in
+        // data-appsrc, real absolute URLs in data-srcset, cropped social card in og:image.
+        let html = r#"<html><head>
+            <meta property="og:image" content="https://www.lrb.co.uk/storage/social_image_on_bg/images/4/0/1/9/30999104-1-eng-GB/478.jpg">
+        </head><body>
+          <div class="article-issue-cover-image"><span class="lrb-imageHolder">
+            <img src="" data-appsrc="//images/4/0/1/9/30999104-1-eng-GB/478.jpg"
+                 data-srcset="https://www.lrb.co.uk/storage/400_filter/images/4/0/1/9/30999104-1-eng-GB/478.jpg 400w, https://www.lrb.co.uk/storage/800_filter/images/4/0/1/9/30999104-1-eng-GB/478.jpg 800w, https://www.lrb.co.uk/storage/1200_filter/images/4/0/1/9/30999104-1-eng-GB/478.jpg 1200w, https://www.lrb.co.uk/storage/2000_filter/images/4/0/1/9/30999104-1-eng-GB/478.jpg 1600w"
+                 class="lazyload" alt="">
+          </span></div>
+        </body></html>"#;
+        let doc = Html::parse_document(html);
+        assert_eq!(
+            extract_cover_uri(&doc),
+            "https://www.lrb.co.uk/storage/2000_filter/images/4/0/1/9/30999104-1-eng-GB/478.jpg"
+        );
+    }
+
+    #[test]
+    fn test_cover_og_image_social_variant_rewritten() {
+        // If only og:image is available, rewrite the cropped social variant to full size.
+        let html = r#"<html><head>
+            <meta property="og:image" content="https://www.lrb.co.uk/storage/social_image_on_bg/images/4/0/1/9/x.jpg">
+        </head><body></body></html>"#;
+        let doc = Html::parse_document(html);
+        assert_eq!(
+            extract_cover_uri(&doc),
+            "https://www.lrb.co.uk/storage/2000_filter/images/4/0/1/9/x.jpg"
         );
     }
 
