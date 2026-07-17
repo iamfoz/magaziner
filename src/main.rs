@@ -23,8 +23,12 @@ use validation::{
     MagazineSource, detect_source, issue_id_from_url, source_code, validate_magazine_url,
 };
 
-/// Default archive listing page used by `--all` to discover LRB issues.
-const LRB_ARCHIVE_URL: &str = "https://www.lrb.co.uk/the-paper";
+/// Default archive listing page used by `--all` to discover LRB issues. This shows the
+/// current volume; discovery walks back to older volumes via the "Previous Volume" button.
+const LRB_ARCHIVE_URL: &str = "https://www.lrb.co.uk/archive";
+
+/// Safety cap on how many archive/volume pages `--all` will visit (there are ~48 volumes).
+const MAX_ARCHIVE_PAGES: usize = 80;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -181,9 +185,33 @@ fn run_all(
     let client = make_client(None)?;
     let adapter = LondonReviewAdapter;
 
-    progress.step(&format!("Discovering issues from {}…", LRB_ARCHIVE_URL));
-    let doc = fetch_html_body(&client, LRB_ARCHIVE_URL, &args.delay, progress)?;
-    let issues = adapter.discover_issues(&doc, progress);
+    progress.step(&format!("Discovering issues from {} (walking all volumes)…", LRB_ARCHIVE_URL));
+    let mut issues: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut page = Some(LRB_ARCHIVE_URL.to_string());
+    let mut pages = 0usize;
+
+    while let Some(url) = page {
+        let doc = fetch_html_body(&client, &url, &args.delay, progress)?;
+        let mut found = 0;
+        for issue in adapter.discover_issues(&doc, progress) {
+            if seen.insert(issue.clone()) {
+                issues.push(issue);
+                found += 1;
+            }
+        }
+        progress.info(&format!("{}: {} issues", url, found));
+
+        pages += 1;
+        if pages >= MAX_ARCHIVE_PAGES {
+            progress.warn(&format!(
+                "Stopped after {} archive pages (safety cap).",
+                MAX_ARCHIVE_PAGES
+            ));
+            break;
+        }
+        page = adapter.next_archive_page(&doc, progress);
+    }
 
     if issues.is_empty() {
         bail!("No issues found on the archive page. The site markup may have changed.");

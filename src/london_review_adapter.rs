@@ -91,25 +91,63 @@ impl MagazineAdapter for LondonReviewAdapter {
     }
 
     fn discover_issues(&self, doc: &Html, progress: &Progress) -> Vec<String> {
+        // Prefer the archive grid's issue cards; fall back to any canonical issue link.
+        let grid_sel = Selector::parse("a.archive-results--grid-link").unwrap();
         let a_sel = Selector::parse("a").unwrap();
         // Canonical issue-index links only: /the-paper/vNN/nNN (no deeper path).
         let re = Regex::new(r"^(?:https://www\.lrb\.co\.uk)?/the-paper/v\d{2}/n\d{2}/?$").unwrap();
 
         let mut seen = std::collections::HashSet::new();
         let mut issues = Vec::new();
-        for el in doc.select(&a_sel) {
-            if let Some(href) = el.value().attr("href")
-                && re.is_match(href.trim())
-            {
+
+        let mut collect = |href: &str| {
+            if re.is_match(href.trim()) {
                 let url = absolutize(BASE, href.trim());
                 let url = url.trim_end_matches('/').to_string();
                 if seen.insert(url.clone()) {
                     issues.push(url);
                 }
             }
+        };
+
+        let grid: Vec<_> = doc.select(&grid_sel).collect();
+        if grid.is_empty() {
+            for el in doc.select(&a_sel) {
+                if let Some(href) = el.value().attr("href") {
+                    collect(href);
+                }
+            }
+        } else {
+            for el in grid {
+                if let Some(href) = el.value().attr("href") {
+                    collect(href);
+                }
+            }
         }
-        progress.verbose(&format!("Discovered {} issue links", issues.len()));
+
+        progress.verbose(&format!("Discovered {} issue links on this page", issues.len()));
         issues
+    }
+
+    fn next_archive_page(&self, doc: &Html, progress: &Progress) -> Option<String> {
+        let prev_sel = Selector::parse("a[title=\"Previous Volume\"]").unwrap();
+        let vol_re = Regex::new(r"^(?:https://www\.lrb\.co\.uk)?/archive/v\d{2}/?$").unwrap();
+
+        for el in doc.select(&prev_sel) {
+            // The button is disabled (href="#") on the oldest volume.
+            let class = el.value().attr("class").unwrap_or("");
+            if class.contains("disabled") {
+                continue;
+            }
+            if let Some(href) = el.value().attr("href")
+                && vol_re.is_match(href.trim())
+            {
+                let url = absolutize(BASE, href.trim());
+                progress.verbose(&format!("Next archive page: {}", url));
+                return Some(url.trim_end_matches('/').to_string());
+            }
+        }
+        None
     }
 }
 
@@ -425,12 +463,31 @@ mod tests {
         assert_eq!(
             issues,
             vec![
-                "https://www.lrb.co.uk/the-paper/v48/n02",
                 "https://www.lrb.co.uk/the-paper/v48/n01",
-                "https://www.lrb.co.uk/the-paper/v47/n24",
-                "https://www.lrb.co.uk/the-paper/v47/n23",
+                "https://www.lrb.co.uk/the-paper/v48/n02",
+                "https://www.lrb.co.uk/the-paper/v48/n03",
             ],
-            "Should return canonical issue URLs only, deduped and absolutized"
+            "Should return the volume's issue cards, deduped and absolutized"
         );
+    }
+
+    #[test]
+    fn test_next_archive_page_points_to_previous_volume() {
+        let doc = load_html_fixture("src/test/lrb/archive.html");
+        let progress = Progress::new(Verbosity::Quiet);
+        let next = LondonReviewAdapter.next_archive_page(&doc, &progress);
+        assert_eq!(next.as_deref(), Some("https://www.lrb.co.uk/archive/v47"));
+    }
+
+    #[test]
+    fn test_next_archive_page_none_when_disabled() {
+        // Oldest volume: the Previous Volume button is disabled with href="#".
+        let html = r##"<html><body><div class="archive-nav--prevnext">
+            <a href="#" class="white-circle-button flipped disabled" title="Previous Volume"><span>Previous Volume</span></a>
+            <a href="/archive/v02" class="white-circle-button" title="Next Volume"><span>Next Volume</span></a>
+        </div></body></html>"##;
+        let doc = Html::parse_document(html);
+        let progress = Progress::new(Verbosity::Quiet);
+        assert_eq!(LondonReviewAdapter.next_archive_page(&doc, &progress), None);
     }
 }

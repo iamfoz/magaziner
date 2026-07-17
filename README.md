@@ -90,25 +90,28 @@ Either `--url` or `--all` is required.
 
 ### Automated mode & history
 
-`--all` discovers issues from the LRB archive index and downloads every one that is not
-already recorded in the history file:
+`--all` discovers issues from the LRB archive (`/archive`) and downloads every one that is
+not already recorded in the history file:
 
 ```bash
 magaziner --all --output ~/Books
 ```
 
-Each successful download is recorded in `~/Books/.magaziner-history.json` (override with
-`--history`). On the next run, issues already in the history are skipped, so `--all` only
-fetches what's new. Use `--force` to re-download regardless of history, or `--list` to see
-which issues *would* be downloaded without fetching anything:
+Discovery starts at the current volume and walks **back through every volume** via the
+archive's "Previous Volume" link, so the first run finds the entire LRB back catalogue
+(~48 volumes). Each successful download is recorded in `~/Books/.magaziner-history.json`
+(override with `--history`). On the next run, issues already in the history are skipped, so
+`--all` only fetches what's new. Use `--force` to re-download regardless of history, or
+`--list` to see which issues *would* be downloaded without fetching anything:
 
 ```bash
-magaziner --all --list          # dry run
+magaziner --all --list          # dry run: print every issue that would be downloaded
 magaziner --all --force         # re-download everything discovered
 ```
 
-> Discovery reads the issues linked from the archive index page. To backfill a specific
-> older issue that isn't linked there, download it directly by URL.
+> The first `--all` run can discover a thousand-plus issues. Run `--all --list` first to
+> see the scope, and remember each download honours `--delay`. You can stop at any time;
+> the history file lets a later run pick up where you left off.
 
 ### Concurrency
 
