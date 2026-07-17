@@ -33,6 +33,18 @@ pub fn validate_magazine_url(s: &str) -> Result<String, String> {
     }
 }
 
+/// True if `u` is an absolute http(s) URL with a real (dotted) hostname. Used to reject
+/// mangled candidates like `https://images/...` produced from JS-placeholder `<img>` tags.
+pub fn is_valid_http_url(u: &str) -> bool {
+    match Url::parse(u) {
+        Ok(url) => {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().map(|h| h.contains('.')).unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
 /// Resolve a possibly-relative `href` against `base`, returning an absolute URL.
 /// Handles root-relative (`/a/b`), protocol-relative (`//host/x`), and already-absolute
 /// URLs correctly. Falls back to the raw `href` if resolution fails.
@@ -169,6 +181,16 @@ mod tests {
             absolutize("https://www.lrb.co.uk/x", "https://cdn.example.com/c.jpg"),
             "https://cdn.example.com/c.jpg"
         );
+    }
+
+    #[test]
+    fn test_is_valid_http_url() {
+        assert!(is_valid_http_url("https://www.lrb.co.uk/storage/cover.jpg"));
+        assert!(is_valid_http_url("http://example.com/x"));
+        // Mangled host with no dot — the bug we're guarding against.
+        assert!(!is_valid_http_url("https://images/4/0/1/9/x.jpg"));
+        assert!(!is_valid_http_url("/storage/relative.jpg"));
+        assert!(!is_valid_http_url("ftp://example.com/x"));
     }
 
     #[test]

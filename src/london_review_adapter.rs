@@ -1,6 +1,6 @@
 use crate::adapter::{ArticleData, IssueData, MagazineAdapter};
 use crate::progress::Progress;
-use crate::validation::absolutize;
+use crate::validation::{absolutize, is_valid_http_url};
 use regex::Regex;
 use scraper::{Html, Selector};
 
@@ -129,21 +129,34 @@ fn extract_cover_uri(doc: &Html) -> String {
         "img.cover-image",
         "img.issue-cover",
     ];
-    for sel in IMG_SELECTORS {
-        if let Some(uri) = first_img_src(doc, sel) {
-            return absolutize(BASE, &uri);
-        }
-    }
-
     const META_SELECTORS: &[&str] = &[
         r#"meta[property="og:image"]"#,
         r#"meta[name="og:image"]"#,
         r#"meta[name="twitter:image"]"#,
         r#"meta[name="twitter:image:src"]"#,
     ];
+
+    // Gather candidates in priority order: the dedicated cover element first, then the
+    // server-rendered social-image meta tags.
+    let mut candidates: Vec<String> = Vec::new();
+    for sel in IMG_SELECTORS {
+        if let Some(uri) = first_img_src(doc, sel) {
+            candidates.push(uri);
+        }
+    }
     for sel in META_SELECTORS {
         if let Some(content) = meta_content(doc, sel) {
-            return absolutize(BASE, &content);
+            candidates.push(content);
+        }
+    }
+
+    // Return the first candidate that resolves to a valid absolute URL. This skips mangled
+    // JS-placeholder img sources (e.g. `//images/...` → `https://images/...`) and falls
+    // through to the og:image meta tag, which on an LRB issue page is the cover.
+    for cand in &candidates {
+        let abs = absolutize(BASE, cand);
+        if is_valid_http_url(&abs) {
+            return abs;
         }
     }
 
@@ -277,6 +290,23 @@ mod tests {
         assert_eq!(
             extract_cover_uri(&doc),
             "https://www.lrb.co.uk/storage/covers/n01.jpg"
+        );
+    }
+
+    #[test]
+    fn test_cover_skips_mangled_js_placeholder_img() {
+        // Reproduces the real LRB case: the <img> is a JS placeholder whose src is a
+        // protocol-relative "//images/..." template that absolutizes to the bogus
+        // "https://images/..."; extraction must reject it and use the og:image cover.
+        let html = r#"<html><head>
+            <meta property="og:image" content="https://www.lrb.co.uk/storage/2000_filter/images/4/0/1/9/30999104-1-eng-GB/478.jpg">
+        </head><body>
+            <div class="article-issue-cover-image"><img data-appsrc="//images/4/0/1/9/30999104-1-eng-GB/478.jpg"></div>
+        </body></html>"#;
+        let doc = Html::parse_document(html);
+        assert_eq!(
+            extract_cover_uri(&doc),
+            "https://www.lrb.co.uk/storage/2000_filter/images/4/0/1/9/30999104-1-eng-GB/478.jpg"
         );
     }
 
