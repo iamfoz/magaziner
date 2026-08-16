@@ -427,6 +427,27 @@ mod tests {
     }
 
     #[test]
+    fn test_artwork_gallery_body_sanitizes_cleanly() {
+        // The Harper's artwork gallery body: figure + embedded image + figcaption with
+        // inline markup. With the image successfully embedded, everything survives.
+        let body = r#"<figure class="issue-art"><img src="https://wp.harpers.org/a.jpg" alt=""/><figcaption><em>Predatory Drift</em>, a painting by Rachel Simon Marino</figcaption></figure>"#;
+        let mut images = HashMap::new();
+        images.insert(
+            "https://wp.harpers.org/a.jpg".to_string(),
+            Some("images/a0_0.jpeg".to_string()),
+        );
+        let out = sanitize_body_to_xhtml(body, &images, TEST_BASE);
+        assert!(out.contains(r#"<figure class="issue-art">"#), "got: {}", out);
+        assert!(out.contains(r#"<img src="images/a0_0.jpeg""#), "got: {}", out);
+        assert!(out.contains("<em>Predatory Drift</em>"), "got: {}", out);
+
+        // If the image download failed, the figure degrades to caption-only but stays valid.
+        let out = sanitize_body_to_xhtml(body, &no_images(), TEST_BASE);
+        assert!(!out.contains("<img"), "got: {}", out);
+        assert!(out.contains("<figcaption>"), "got: {}", out);
+    }
+
+    #[test]
     fn test_escape_text() {
         assert_eq!(escape_text("A & B < C > D"), "A &amp; B &lt; C &gt; D");
     }

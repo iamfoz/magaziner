@@ -4,7 +4,10 @@
   <title>Test Article | Harper's Magazine</title>
 </head>
 <body>
-  <h1 class="article-title">Test Article Title</h1>
+  <div class="article-header">
+    <h1 class="article-title">Test Article Title</h1>
+    <div class="byline">by <a href="/author/samuelmoyn/">Samuel Moyn</a></div>
+  </div>
   <div class="wysiwyg-content entry-content">
     <div class="header-meta">
       <button>Adjust</button>
@@ -12,6 +15,15 @@
     </div>
     <p>This is a synthetic article body used for testing. It contains enough text to exceed the
     one-hundred character minimum that the test asserts, with no copyrighted content included.</p>
+    <figure>
+      <img src="https://wp.harpers.org/wp-content/uploads/2026/03/CUT-9-1-768x888.jpg" alt="">
+      <figcaption>Mid-article artwork caption</figcaption>
+    </figure>
+    <p>More text after the artwork so the article continues past the image.</p>
+    <div class="related-articles">
+      <a href="/archive/2026/05/other-article/">Other article</a>
+      <a href="/author/someoneelse/">Someone Else</a>
+    </div>
   </div>
 </body>
 </html>

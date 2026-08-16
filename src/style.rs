@@ -284,6 +284,12 @@ figcaption {
   opacity: 0.85;
 }
 
+/* Artwork-gallery slides (e.g. Harper's issue slideshow): one work per "plate",
+   with generous separation. */
+figure.issue-art {
+  margin: 2.4em 0;
+}
+
 /* ---------------------------------------------------------------------
    Table of contents
    --------------------------------------------------------------------- */

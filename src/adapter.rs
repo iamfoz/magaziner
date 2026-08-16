@@ -6,6 +6,9 @@ pub struct IssueData {
     pub title: String,
     pub cover_image_uri: String,
     pub publication_name: String,
+    /// Ready-made articles extracted from the issue page itself (e.g. Harper's artwork
+    /// slideshow), appended to the EPUB after the fetched articles.
+    pub extra_articles: Vec<ArticleData>,
 }
 
 pub struct ArticleData {

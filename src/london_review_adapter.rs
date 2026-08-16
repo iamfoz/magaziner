@@ -1,5 +1,6 @@
 use crate::adapter::{ArticleData, IssueData, MagazineAdapter};
 use crate::progress::Progress;
+use crate::scrape::{best_from_srcset, meta_content};
 use crate::validation::{absolutize, is_valid_http_url};
 use regex::Regex;
 use scraper::{Html, Selector};
@@ -40,6 +41,7 @@ impl MagazineAdapter for LondonReviewAdapter {
             title,
             cover_image_uri,
             publication_name: "London Review of Books".to_string(),
+            extra_articles: Vec::new(),
         }
     }
 
@@ -179,7 +181,7 @@ fn extract_cover_uri(doc: &Html) -> String {
         // 1. Prefer the highest-resolution candidate from the responsive srcset. On LRB
         //    this yields the full 2000-wide cover; the single-URL `data-appsrc` is a
         //    JS placeholder ("//images/...") and `og:image` is a cropped social card.
-        if let Some(u) = best_from_srcset(&img)
+        if let Some(u) = best_from_srcset(&img, BASE)
             && is_valid_http_url(&u)
         {
             return u;
@@ -215,42 +217,6 @@ fn extract_cover_uri(doc: &Html) -> String {
     }
 
     String::new()
-}
-
-/// Pick the largest-width URL from an element's `data-srcset`/`srcset`. A srcset entry is
-/// "url 1600w" (or "url 2x"); we parse the numeric descriptor and keep the biggest.
-fn best_from_srcset(img: &scraper::ElementRef<'_>) -> Option<String> {
-    let raw = img
-        .value()
-        .attr("data-srcset")
-        .or_else(|| img.value().attr("srcset"))?;
-
-    let mut best: Option<(u32, String)> = None;
-    for candidate in raw.split(',') {
-        let mut parts = candidate.split_whitespace();
-        let Some(url) = parts.next() else {
-            continue;
-        };
-        let width = parts
-            .next()
-            .map(|d| d.trim_end_matches(['w', 'x']))
-            .and_then(|d| d.parse::<u32>().ok())
-            .unwrap_or(0);
-        if best.as_ref().map(|(w, _)| width >= *w).unwrap_or(true) {
-            best = Some((width, url.to_string()));
-        }
-    }
-    best.map(|(_, url)| absolutize(BASE, &url))
-}
-
-/// The `content` attribute of the first element matching `selector`, if non-empty.
-fn meta_content(doc: &Html, selector: &str) -> Option<String> {
-    let sel = Selector::parse(selector).ok()?;
-    doc.select(&sel)
-        .next()
-        .and_then(|el| el.value().attr("content"))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 /// "Contents · Vol. 99 No. 3 · 15 March 2025" → "Vol. 99 No. 3 · 15 March 2025".

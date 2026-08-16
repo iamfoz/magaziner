@@ -20,7 +20,7 @@ Magazine websites are noisy, require a live internet connection, and often restr
 - Fetches the real cover image (resolving lazy-loaded, relative URLs) and embeds it with the correct MIME type
 - Embeds in-article images as EPUB resources rather than stripping them
 - Ships a curated, e-reader-optimised stylesheet — clean typography, styled block quotes, reviewed-items, bylines, and figures — instead of dumping the website's own CSS
-- **Automated `--all` mode**: discovers LRB issues from the archive and downloads any not already fetched
+- **Automated `--all` mode**: discovers issues from the magazine's archive (LRB or Harper's via `--source`) and downloads any not already fetched
 - **Download history**: records every downloaded issue and skips re-downloads unless `--force`
 - **Concurrent article downloads** with a configurable worker count (`--concurrency`)
 - A smooth in-place progress bar
@@ -72,7 +72,8 @@ magaziner [OPTIONS]
 
 Options:
   -u, --url <URL>                  Magazine archive URL (LRB or Harper's)
-      --all                        Download every LRB issue not already in the history file
+      --all                        Download every issue not already in the history file (see --source)
+      --source <SOURCE>            Which magazine --all discovers: lrb or harpers [default: lrb]
       --list                       With --all: list the issues that would be downloaded, then exit
   -o, --output <OUTPUT>            Output directory for generated EPUBs [default: .]
       --history <HISTORY>          Path to the download-history file [default: <output>/.magaziner-history.json]
@@ -90,23 +91,28 @@ Either `--url` or `--all` is required.
 
 ### Automated mode & history
 
-`--all` discovers issues from the LRB archive (`/archive`) and downloads every one that is
-not already recorded in the history file:
+`--all` discovers a magazine's issues from its archive and downloads every one that is
+not already recorded in the history file. Pick the magazine with `--source` (default
+`lrb`):
 
 ```bash
-magaziner --all --output ~/Books
+magaziner --all --output ~/Books                    # LRB
+magaziner --all --source harpers --output ~/Books   # Harper's
 ```
 
-Discovery starts at the current volume and walks **back through every volume** via the
-archive's "Previous Volume" link, so the first run finds the entire LRB back catalogue
-(~48 volumes). Each successful download is recorded in `~/Books/.magaziner-history.json`
-(override with `--history`). On the next run, issues already in the history are skipped, so
-`--all` only fetches what's new. Use `--force` to re-download regardless of history, or
-`--list` to see which issues *would* be downloaded without fetching anything:
+For the LRB, discovery starts at the current volume on `/archive` and walks **back
+through every volume** via the "Previous Volume" link (~48 volumes). For Harper's, it
+starts at `harpers.org/issues/` and follows the archive's pagination back through the
+back catalogue. Each successful download is recorded in
+`~/Books/.magaziner-history.json` (override with `--history`). On the next run, issues
+already in the history are skipped, so `--all` only fetches what's new. Use `--force` to
+re-download regardless of history, or `--list` to see which issues *would* be downloaded
+without fetching anything:
 
 ```bash
-magaziner --all --list          # dry run: print every issue that would be downloaded
-magaziner --all --force         # re-download everything discovered
+magaziner --all --list                    # dry run: print every issue that would be downloaded
+magaziner --all --source harpers --list   # same, for Harper's
+magaziner --all --force                   # re-download everything discovered
 ```
 
 > The first `--all` run can discover a thousand-plus issues. Run `--all --list` first to
@@ -133,14 +139,24 @@ The URL must match the format `https://www.lrb.co.uk/the-paper/vNN/nNN` — the 
 
 ### Harper's Magazine
 
-Harper's requires an active subscription to access full article content. Export your session cookie from a logged-in browser and set the `HARPERS_COOKIE` environment variable before running:
+```bash
+magaziner --url https://harpers.org/archive/2026/05/
+```
+
+The URL must match the format `https://harpers.org/archive/YYYY/MM`. The generated EPUB
+includes the issue's cover, every listed article/essay/reading (with bylines and any
+artwork embedded in the article body), and an **"Artwork from this Issue"** gallery built
+from the issue page's photograph slideshow, with captions.
+
+Harper's metered paywall counts reads via browser cookies. magaziner holds no cookie
+jar, so each request arrives like a fresh private-browsing window and the meter never
+accumulates — no subscription is needed for metered content. If you have a subscription
+and want to fetch subscriber-only content, you can still pass your session cookies:
 
 ```bash
 export HARPERS_COOKIE="your_session_cookie_string_here"
-magaziner --url https://harpers.org/archive/2026/02
+magaziner --url https://harpers.org/archive/2026/05/
 ```
-
-The URL must match the format `https://harpers.org/archive/YYYY/MM`.
 
 > **Getting your cookie:** In Chrome or Firefox, open DevTools → Application → Cookies while logged in to `harpers.org`, then copy the full cookie string from the `Cookie` request header (visible in the Network tab on any page request).
 
@@ -264,7 +280,7 @@ Then add a regex branch to `detect_source()` in `validation.rs` and wire up the 
 
 | Variable | Description |
 |---|---|
-| `HARPERS_COOKIE` | Raw `Cookie` header value for an authenticated Harper's session. Required for full subscriber access. If unset, a warning is printed and only free-tier content will be available. |
+| `HARPERS_COOKIE` | Raw `Cookie` header value for an authenticated Harper's session. Optional: only needed for subscriber-only content. Without it, requests carry no cookies at all, so Harper's metered paywall never accumulates. |
 
 ---
 

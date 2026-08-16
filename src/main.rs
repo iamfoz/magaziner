@@ -5,6 +5,7 @@ mod harpers_adapter;
 mod history;
 mod london_review_adapter;
 mod progress;
+mod scrape;
 mod style;
 mod validation;
 
@@ -27,8 +28,18 @@ use validation::{
 /// current volume; discovery walks back to older volumes via the "Previous Volume" button.
 const LRB_ARCHIVE_URL: &str = "https://www.lrb.co.uk/archive";
 
-/// Safety cap on how many archive/volume pages `--all` will visit (there are ~48 volumes).
-const MAX_ARCHIVE_PAGES: usize = 80;
+/// Harper's back-issues archive; `--all --source harpers` walks its pagination.
+const HARPERS_ARCHIVE_URL: &str = "https://harpers.org/issues/";
+
+/// Safety cap on how many archive pages `--all` will visit per source. LRB has ~48
+/// volume pages; Harper's is monthly since 1850, so its paginated archive runs to a few
+/// hundred pages depending on issues-per-page.
+fn max_archive_pages(source: &MagazineSource) -> usize {
+    match source {
+        MagazineSource::LondonReview => 80,
+        MagazineSource::Harpers => 400,
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -49,10 +60,18 @@ struct Args {
 
     #[arg(
         long,
-        help = "Download every LRB issue not already in the history file",
+        help = "Download every issue not already in the history file (see --source)",
         default_value_t = false
     )]
     all: bool,
+
+    #[arg(
+        long,
+        value_parser = parse_source,
+        default_value = "lrb",
+        help = "Which magazine --all discovers: lrb or harpers"
+    )]
+    source: MagazineSource,
 
     #[arg(
         long,
@@ -119,6 +138,15 @@ enum Outcome {
     Skipped,
 }
 
+/// Parse the `--source` flag value.
+fn parse_source(s: &str) -> Result<MagazineSource, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "lrb" | "londonreview" | "london-review" => Ok(MagazineSource::LondonReview),
+        "harpers" | "harper's" | "harper" => Ok(MagazineSource::Harpers),
+        other => Err(format!("unknown source '{}': use 'lrb' or 'harpers'", other)),
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -170,7 +198,8 @@ fn run_single(
     Ok(())
 }
 
-/// Automated mode: discover LRB issues and download those not yet in the history.
+/// Automated mode: discover the selected source's issues and download those not yet in
+/// the history.
 fn run_all(
     args: &Args,
     progress: &Progress,
@@ -181,17 +210,34 @@ fn run_all(
         progress.warn("--name is ignored in --all mode; filenames are derived per issue.");
     }
 
-    let source = MagazineSource::LondonReview;
-    let client = make_client(None)?;
-    let adapter = LondonReviewAdapter;
+    let source = args.source.clone();
+    let cookie = harpers_cookie_for(&source);
+    let client = make_client(cookie.as_deref())?;
+    let adapter: Box<dyn MagazineAdapter> = match source {
+        MagazineSource::LondonReview => Box::new(LondonReviewAdapter),
+        MagazineSource::Harpers => Box::new(HarpersAdapter),
+    };
+    let start_url = match source {
+        MagazineSource::LondonReview => LRB_ARCHIVE_URL,
+        MagazineSource::Harpers => HARPERS_ARCHIVE_URL,
+    };
+    let max_pages = max_archive_pages(&source);
 
-    progress.step(&format!("Discovering issues from {} (walking all volumes)…", LRB_ARCHIVE_URL));
+    progress.step(&format!(
+        "Discovering issues from {} (walking the whole archive)…",
+        start_url
+    ));
     let mut issues: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut page = Some(LRB_ARCHIVE_URL.to_string());
+    let mut visited_pages = std::collections::HashSet::new();
+    let mut page = Some(start_url.to_string());
     let mut pages = 0usize;
 
     while let Some(url) = page {
+        // Guard against pagination cycles (e.g. a "next" link pointing back at page 1).
+        if !visited_pages.insert(url.clone()) {
+            break;
+        }
         let doc = fetch_html_body(&client, &url, &args.delay, progress)?;
         let mut found = 0;
         for issue in adapter.discover_issues(&doc, progress) {
@@ -203,10 +249,10 @@ fn run_all(
         progress.info(&format!("{}: {} issues", url, found));
 
         pages += 1;
-        if pages >= MAX_ARCHIVE_PAGES {
+        if pages >= max_pages {
             progress.warn(&format!(
                 "Stopped after {} archive pages (safety cap).",
-                MAX_ARCHIVE_PAGES
+                max_pages
             ));
             break;
         }
@@ -315,7 +361,7 @@ fn process_issue(
         issue.links.len(),
         args.concurrency
     ));
-    let articles = fetch_articles(
+    let mut articles = fetch_articles(
         client,
         &issue.links,
         args.delay,
@@ -327,6 +373,10 @@ fn process_issue(
     if articles.is_empty() {
         bail!("Every article failed to download for this issue.");
     }
+
+    // Ready-made sections extracted from the issue page itself (e.g. Harper's artwork
+    // slideshow) go in after the fetched articles.
+    articles.extend(issue.extra_articles);
 
     build_epub(
         progress,
@@ -370,19 +420,18 @@ fn persist_download(path: &Path, history: &mut History, entry: HistoryEntry) -> 
     Ok(())
 }
 
+/// Optional subscriber cookies for Harper's (raw Cookie header via HARPERS_COOKIE).
+///
+/// Running without cookies is normal and usually preferable: the metered paywall counts
+/// reads via cookies, and this client has no cookie jar, so every request arrives like a
+/// fresh private-browsing window and the meter never accumulates.
 fn harpers_cookie_for(source: &MagazineSource) -> Option<String> {
     if !matches!(source, MagazineSource::Harpers) {
         return None;
     }
-    // HARPERS_COOKIE is the raw Cookie header value from an authenticated browser session.
     match std::env::var("HARPERS_COOKIE") {
         Ok(c) if !c.is_empty() => Some(c),
-        _ => {
-            eprintln!(
-                "Warning: HARPERS_COOKIE env var not set; subscriber content may be inaccessible."
-            );
-            None
-        }
+        _ => None,
     }
 }
 
