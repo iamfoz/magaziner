@@ -159,8 +159,15 @@ magaziner --url https://harpers.org/archive/2026/05/ --concurrency 2 --delay 500
 
 Harper's metered paywall counts reads via browser cookies. magaziner holds no cookie
 jar, so each request arrives like a fresh private-browsing window and the meter never
-accumulates — no subscription is needed for metered content. If you have a subscription
-and want to fetch subscriber-only content, you can still pass your session cookies:
+accumulates — no subscription is needed for metered content. For articles Harper's
+truncates server-side regardless of cookies, magaziner detects the short body and
+automatically retries via public archives (the Wayback Machine, then archive.ph),
+keeping whichever copy has the most text. Sections with no usable content at all (an
+empty archive card, a PDF-only puzzle without PDF access) are dropped from the EPUB
+rather than shipped as blank pages.
+
+If you have a subscription and want to fetch subscriber-only content directly, you can
+still pass your session cookies:
 
 ```bash
 export HARPERS_COOKIE="your_session_cookie_string_here"

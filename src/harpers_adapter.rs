@@ -160,6 +160,9 @@ impl MagazineAdapter for HarpersAdapter {
         }
 
         let byline = extract_byline(doc);
+        // Some titles carry the byline ("Ways of Peeing, by Thomas W. Laqueur") — the
+        // byline is rendered separately, so remove it from the title.
+        let title = strip_byline_suffix(title, byline.as_deref());
 
         progress.verbose(&format!("Extracted: {}", title));
 
@@ -331,12 +334,29 @@ fn extract_artwork(doc: &Html, progress: &Progress) -> Vec<ArticleData> {
 /// `caption-attachment-<id>` element). Returns `None` when there is no lead image or the
 /// body already contains the same file (no duplication).
 fn extract_lead_image(doc: &Html, body_sel: &Selector, body: &str) -> Option<String> {
-    let img_sel = Selector::parse(r#"img[class*="wp-image-"]"#).unwrap();
+    // Lead-image shapes seen in the wild: the <picture class="article-hero-img"> hero,
+    // and a bare WP attachment image in the article header.
+    const LEAD_IMG_SELECTORS: &[&str] = &[
+        "picture.article-hero-img img",
+        ".article-hero-img img",
+        r#"img[class*="wp-image-"]"#,
+    ];
     let body_ids: Vec<_> = doc.select(body_sel).map(|el| el.id()).collect();
 
-    let img = doc.select(&img_sel).find(|img| {
-        !img.ancestors().any(|n| body_ids.contains(&n.id()))
-    })?;
+    let mut img = None;
+    for sel in LEAD_IMG_SELECTORS {
+        let Ok(selector) = Selector::parse(sel) else {
+            continue;
+        };
+        if let Some(found) = doc
+            .select(&selector)
+            .find(|i| !i.ancestors().any(|n| body_ids.contains(&n.id())))
+        {
+            img = Some(found);
+            break;
+        }
+    }
+    let img = img?;
 
     let src = img
         .value()
@@ -356,12 +376,24 @@ fn extract_lead_image(doc: &Html, body_sel: &Selector, body: &str) -> Option<Str
         .unwrap_or_default();
     let alt = img.value().attr("alt").unwrap_or("");
 
+    // Caption: the aria-describedby target (WP's caption-attachment-<id>), or a
+    // .wp-caption-text within the image's wrapper (the <picture> hero keeps its caption
+    // as a sibling <p> inside the same element).
     let caption = img
         .value()
         .attr("aria-describedby")
         .and_then(|id| Selector::parse(&format!(r#"[id="{}"]"#, id)).ok())
         .and_then(|sel| doc.select(&sel).next())
-        .map(|el| flatten_caption(&el.inner_html()))
+        .map(|el| el.inner_html())
+        .or_else(|| {
+            let cap_sel = Selector::parse(".wp-caption-text").ok()?;
+            img.ancestors()
+                .take(3)
+                .filter_map(scraper::ElementRef::wrap)
+                .find_map(|anc| anc.select(&cap_sel).next())
+                .map(|el| el.inner_html())
+        })
+        .map(|html| flatten_caption(&html))
         .filter(|c| !c.is_empty())
         .map(|c| format!("<figcaption>{}</figcaption>", c))
         .unwrap_or_default();
@@ -378,6 +410,23 @@ fn extract_lead_image(doc: &Html, body_sel: &Selector, body: &str) -> Option<Str
 /// Minimal attribute escaping for HTML we synthesize ourselves.
 fn esc_attr(s: &str) -> String {
     s.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+/// Strip a trailing ", by <byline>" (or " by <byline>") from a title when it matches the
+/// separately-extracted byline, so authors aren't shown twice.
+fn strip_byline_suffix(title: String, byline: Option<&str>) -> String {
+    if let Some(b) = byline.filter(|b| !b.is_empty()) {
+        for sep in [", by ", " by "] {
+            let suffix = format!("{}{}", sep, b);
+            if title.len() > suffix.len() && title.ends_with(&suffix) {
+                return title[..title.len() - suffix.len()]
+                    .trim_end()
+                    .trim_end_matches(',')
+                    .to_string();
+            }
+        }
+    }
+    title
 }
 
 /// Flatten a slideshow caption's markup: the raw HTML is nested in PDF-export div soup
@@ -438,6 +487,12 @@ fn strip_chrome(mut raw: String, scope: &scraper::ElementRef<'_>) -> String {
         ".related-articles",
         ".newsletter-signup",
         ".after-post",
+        // Paywall CTA furniture and the PDF-access error block.
+        "#ctas",
+        r#"[data-paywall-component="cta-bar"]"#,
+        ".cta-bar",
+        ".cta-popup",
+        ".pdf-only-error",
     ];
     for sel in CHROME_SELECTORS {
         let Ok(selector) = Selector::parse(sel) else {
@@ -605,6 +660,90 @@ mod tests {
             1,
             "The same file must not appear twice: {}",
             article.body
+        );
+    }
+
+    #[test]
+    fn test_hero_picture_lead_image_with_wp_caption_text() {
+        // The Redshift-style hero: <picture class="article-hero-img"> with a sibling
+        // p.wp-caption-text caption, no wp-image-* class on the img.
+        let html = r#"<html><body>
+          <picture class="article-hero-img wp-caption">
+            <img src="https://wp.harpers.org/wp-content/uploads/2026/04/CUT-11-cropped-scaled-900x0-c-default.jpg" alt="Mars" width="1969" height="2560" fetchpriority="high">
+            <p class="wp-caption-text"><span style="font-size: 16px;">All photographs of the Mars Desert Research Station by Cassandra Klos</span>&nbsp;</p>
+          </picture>
+          <div class="wysiwyg-content entry-content"><p>Article text about Mars that goes on long enough to matter for the test body.</p></div>
+        </body></html>"#;
+        let doc = Html::parse_document(html);
+        let progress = Progress::new(Verbosity::Quiet);
+        let article = HarpersAdapter.extract_article(&doc, &progress);
+
+        assert!(
+            article.body.contains("CUT-11-cropped-scaled-900x0-c-default.jpg"),
+            "Hero image should be prepended: {}",
+            article.body
+        );
+        assert!(
+            article.body.contains("Cassandra Klos"),
+            "Hero caption should be attached: {}",
+            article.body
+        );
+        let hero_pos = article.body.find("CUT-11").unwrap();
+        let text_pos = article.body.find("Article text").unwrap();
+        assert!(hero_pos < text_pos, "Hero must come before the body text");
+    }
+
+    #[test]
+    fn test_paywall_cta_and_pdf_error_stripped_from_body() {
+        let html = r##"<html><body>
+          <div class="wysiwyg-content entry-content">
+            <p>Real text.</p>
+            <div id="ctas" data-paywall-component="cta-bar">
+              <div class="cta-bar bg-cadet-blue"><span>Subscribe for less than $2 an issue.</span></div>
+            </div>
+            <div class="pdf-only-error" data-paywall-pdf-error-block="" role="alert">
+              <p data-paywall-pdf-error-text="">Sorry, we could not verify your access to this PDF.</p>
+            </div>
+          </div>
+        </body></html>"##;
+        let doc = Html::parse_document(html);
+        let progress = Progress::new(Verbosity::Quiet);
+        let article = HarpersAdapter.extract_article(&doc, &progress);
+
+        assert!(article.body.contains("Real text."));
+        assert!(
+            !article.body.contains("Subscribe for less than"),
+            "Paywall CTA must be stripped: {}",
+            article.body
+        );
+        assert!(
+            !article.body.contains("could not verify your access"),
+            "PDF error block must be stripped: {}",
+            article.body
+        );
+    }
+
+    #[test]
+    fn test_byline_stripped_from_title() {
+        assert_eq!(
+            strip_byline_suffix(
+                "Ways of Peeing, by Thomas W. Laqueur".to_string(),
+                Some("Thomas W. Laqueur")
+            ),
+            "Ways of Peeing"
+        );
+        assert_eq!(
+            strip_byline_suffix("Redshift by Elena Buckley".to_string(), Some("Elena Buckley")),
+            "Redshift"
+        );
+        // No byline, or a non-matching one, leaves the title alone.
+        assert_eq!(
+            strip_byline_suffix("Death by Chocolate".to_string(), Some("Jane Doe")),
+            "Death by Chocolate"
+        );
+        assert_eq!(
+            strip_byline_suffix("Ways of Peeing, by Thomas W. Laqueur".to_string(), None),
+            "Ways of Peeing, by Thomas W. Laqueur"
         );
     }
 

@@ -9,7 +9,7 @@ mod scrape;
 mod style;
 mod validation;
 
-use adapter::MagazineAdapter;
+use adapter::{ArticleData, MagazineAdapter};
 use anyhow::{Result, bail};
 use clap::Parser;
 use epub::build_epub;
@@ -361,17 +361,40 @@ fn process_issue(
         issue.links.len(),
         args.concurrency
     ));
+    let rescue_from_archives = matches!(source, MagazineSource::Harpers);
     let mut articles = fetch_articles(
         client,
         &issue.links,
         args.delay,
         args.concurrency,
         progress,
-        |d| adapter.extract_article(d, progress),
+        |d, article_url| {
+            let article = adapter.extract_article(d, progress);
+            // A suspiciously short body on a page carrying paywall markup means the
+            // server truncated the article — try public archive snapshots.
+            if rescue_from_archives && body_text_len(&article.body) < PAYWALL_SUSPECT_CHARS {
+                try_archive_rescue(client, article_url, &*adapter, args.delay, progress, article)
+            } else {
+                article
+            }
+        },
     );
 
     if articles.is_empty() {
         bail!("Every article failed to download for this issue.");
+    }
+
+    // Drop sections with no usable content (an empty Index Archive card, a PDF-only
+    // puzzle whose PDF we can't access) rather than shipping blank pages.
+    articles.retain(|a| {
+        let keep = body_text_len(&a.body) >= 40 || a.body.contains("<img");
+        if !keep {
+            progress.warn(&format!("Dropping empty article: {}", a.title));
+        }
+        keep
+    });
+    if articles.is_empty() {
+        bail!("Every article in this issue was empty after extraction.");
     }
 
     // Ready-made sections extracted from the issue page itself (e.g. Harper's artwork
@@ -396,6 +419,78 @@ fn process_issue(
     )?;
 
     Ok(Outcome::Downloaded)
+}
+
+/// Below this many characters of body text, a Harper's article is suspected to be a
+/// paywall-truncated preview and public archives are tried. Genuinely short pieces
+/// (poems, the puzzle) cost a couple of extra requests and keep their original text.
+const PAYWALL_SUSPECT_CHARS: usize = 1500;
+
+/// Plain-text length of an HTML body fragment (whitespace-trimmed).
+fn body_text_len(body: &str) -> usize {
+    let fragment = scraper::Html::parse_fragment(body);
+    fragment
+        .root_element()
+        .text()
+        .map(|t| t.trim().len())
+        .sum()
+}
+
+/// Try to recover a paywalled/truncated article from public archives (Wayback Machine,
+/// then archive.ph). A candidate replaces the original only if it yields strictly more
+/// body text, so a genuinely short piece keeps its original content. Wayback preserves
+/// the source markup (image URLs are rewritten to web.archive.org, which serve fine),
+/// so the adapter's normal extraction applies.
+fn try_archive_rescue(
+    client: &Client,
+    url: &str,
+    adapter: &dyn MagazineAdapter,
+    delay: u64,
+    progress: &Progress,
+    original: ArticleData,
+) -> ArticleData {
+    const ARCHIVE_PREFIXES: &[&str] = &[
+        "https://web.archive.org/web/2/",
+        "https://archive.ph/newest/",
+    ];
+
+    let mut best = original;
+    let mut best_len = body_text_len(&best.body);
+    progress.warn(&format!(
+        "{} looks paywalled/truncated ({} chars); trying public archives…",
+        url, best_len
+    ));
+
+    for prefix in ARCHIVE_PREFIXES {
+        let archive_url = format!("{}{}", prefix, url);
+        match fetch_html_body(client, &archive_url, &delay, progress) {
+            Ok(doc) => {
+                let mut cand = adapter.extract_article(&doc, progress);
+                let len = body_text_len(&cand.body);
+                if len > best_len {
+                    // The archive copy sometimes garbles metadata; keep the original's
+                    // title/byline where the candidate's are missing.
+                    if cand.title == "Untitled" || cand.title.is_empty() {
+                        cand.title = best.title.clone();
+                    }
+                    cand.byline = cand.byline.or_else(|| best.byline.clone());
+                    progress.info(&format!(
+                        "Recovered {} from {} ({} chars)",
+                        cand.title, prefix, len
+                    ));
+                    best = cand;
+                    best_len = len;
+                }
+                if best_len >= PAYWALL_SUSPECT_CHARS {
+                    break;
+                }
+            }
+            Err(e) => {
+                progress.verbose(&format!("Archive fetch failed {}: {:#}", archive_url, e));
+            }
+        }
+    }
+    best
 }
 
 /// Whether an issue still needs downloading: forced, absent from history, or its recorded
@@ -455,7 +550,14 @@ fn sanitize_filename(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_filename;
+    use super::{body_text_len, sanitize_filename};
+
+    #[test]
+    fn test_body_text_len_counts_text_not_markup() {
+        assert_eq!(body_text_len("<p>hi</p>"), 2);
+        assert_eq!(body_text_len("<div><img src=\"x.jpg\"/></div>"), 0);
+        assert!(body_text_len("<p>one two three</p>") >= 11);
+    }
 
     #[test]
     fn test_sanitize_strips_path_separators() {

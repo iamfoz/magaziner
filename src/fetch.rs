@@ -95,8 +95,8 @@ pub fn download_bytes(
 /// preserving the original order. Each request still sleeps `delay` ms first for
 /// politeness. A failed article is logged and skipped rather than aborting the run.
 ///
-/// `extract` maps a parsed article document to `ArticleData`; it must be `Sync` because
-/// it is shared across the worker threads.
+/// `extract` maps a parsed article document (and its source URL) to `ArticleData`; it
+/// must be `Sync` because it is shared across the worker threads.
 pub fn fetch_articles<F>(
     client: &Client,
     links: &[String],
@@ -106,7 +106,7 @@ pub fn fetch_articles<F>(
     extract: F,
 ) -> Vec<ArticleData>
 where
-    F: Fn(&Html) -> ArticleData + Sync,
+    F: Fn(&Html, &str) -> ArticleData + Sync,
 {
     let total = links.len();
     let workers = concurrency.clamp(1, total.max(1));
@@ -126,7 +126,7 @@ where
                     let url = &links[i];
                     match fetch_html_body(client, url, &delay, progress) {
                         Ok(doc) => {
-                            let article = extract(&doc);
+                            let article = extract(&doc, url);
                             bar.inc(&article.title);
                             results.lock().unwrap()[i] = Some(article);
                         }
@@ -160,7 +160,7 @@ where
             let url = &links[i];
             match fetch_html_body(client, url, &retry_delay, progress) {
                 Ok(doc) => {
-                    let article = extract(&doc);
+                    let article = extract(&doc, url);
                     progress.info(&format!("Recovered: {}", article.title));
                     results[i] = Some(article);
                 }
