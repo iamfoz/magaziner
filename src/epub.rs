@@ -213,23 +213,33 @@ fn download_article_images(
 
     let mut map: HashMap<String, Option<String>> = HashMap::new();
     for img in fragment.select(&img_sel) {
-        let Some(src) = img.value().attr("src") else {
+        // The map key is the identifying attribute the serializer will look up: `src`,
+        // or `data-src` for lazy-loaded images with an empty src.
+        let Some(key) = img
+            .value()
+            .attr("src")
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| img.value().attr("data-src"))
+        else {
             continue;
         };
-        if src.trim().is_empty() || map.contains_key(src) {
+        if key.trim().is_empty() || map.contains_key(key) {
             continue;
         }
-        let abs = absolutize(base_url, src);
+        // Download the sharpest available rendition: the largest srcset candidate when
+        // present (src is often a downscaled variant), otherwise the key itself.
+        let abs = crate::scrape::best_from_srcset(&img, base_url)
+            .unwrap_or_else(|| absolutize(base_url, key));
         match download_bytes(client, &abs, Some(base_url), progress) {
             Ok((bytes, mime)) => {
                 let href = format!("images/a{}_{}.{}", article_idx, counter, ext_for_mime(&mime));
                 *counter += 1;
                 epub.add_resource(&href, bytes.as_slice(), mime.as_str())?;
-                map.insert(src.to_string(), Some(href));
+                map.insert(key.to_string(), Some(href));
             }
             Err(e) => {
-                progress.warn(&format!("Dropping image {} ({})", abs, e));
-                map.insert(src.to_string(), None);
+                progress.warn(&format!("Dropping image {} ({:#})", abs, e));
+                map.insert(key.to_string(), None);
             }
         }
     }
@@ -284,8 +294,12 @@ fn serialize_node(
             }
 
             if name == "img" {
-                if let Some(src) = el.attr("src")
-                    && let Some(Some(href)) = images.get(src)
+                let key = el
+                    .attr("src")
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| el.attr("data-src"));
+                if let Some(key) = key
+                    && let Some(Some(href)) = images.get(key)
                 {
                     let alt = el.attr("alt").unwrap_or("");
                     out.push_str(&format!(
@@ -424,6 +438,19 @@ mod tests {
         )
         .unwrap();
         assert!(path.exists(), "epub was not written");
+    }
+
+    #[test]
+    fn test_lazy_image_rewritten_via_data_src_key() {
+        // A lazy-loaded image with an empty src is keyed (and rewritten) by data-src.
+        let body = r#"<p><img src="" data-src="https://x.com/lazy.jpg" alt="a"/></p>"#;
+        let mut images = HashMap::new();
+        images.insert(
+            "https://x.com/lazy.jpg".to_string(),
+            Some("images/a0_0.jpeg".to_string()),
+        );
+        let out = sanitize_body_to_xhtml(body, &images, TEST_BASE);
+        assert!(out.contains(r#"<img src="images/a0_0.jpeg""#), "got: {}", out);
     }
 
     #[test]

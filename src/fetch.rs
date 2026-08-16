@@ -132,7 +132,7 @@ where
                         }
                         Err(e) => {
                             bar.inc("(failed)");
-                            progress.warn(&format!("Skipping article {}: {}", url, e));
+                            progress.warn(&format!("Failed article {}: {:#}", url, e));
                         }
                     }
                 }
@@ -141,7 +141,37 @@ where
     });
     bar.finish();
 
-    results.into_inner().unwrap().into_iter().flatten().collect()
+    let mut results = results.into_inner().unwrap();
+
+    // Recovery pass: concurrent fetching can trip a source's rate limiter, failing every
+    // article from that point on. Wait out the throttle, then retry the failures one at a
+    // time with a gentler cadence.
+    let failed: Vec<usize> = (0..total).filter(|&i| results[i].is_none()).collect();
+    if !failed.is_empty() {
+        const COOLDOWN_SECS: u64 = 60;
+        progress.warn(&format!(
+            "{} article(s) failed; retrying sequentially after a {}s cooldown…",
+            failed.len(),
+            COOLDOWN_SECS
+        ));
+        thread::sleep(Duration::from_secs(COOLDOWN_SECS));
+        let retry_delay = (delay * 2).max(5000);
+        for i in failed {
+            let url = &links[i];
+            match fetch_html_body(client, url, &retry_delay, progress) {
+                Ok(doc) => {
+                    let article = extract(&doc);
+                    progress.info(&format!("Recovered: {}", article.title));
+                    results[i] = Some(article);
+                }
+                Err(e) => {
+                    progress.warn(&format!("Skipping article {}: {:#}", url, e));
+                }
+            }
+        }
+    }
+
+    results.into_iter().flatten().collect()
 }
 
 /// Guess an image MIME type from the file extension, falling back to magic bytes,
@@ -170,7 +200,18 @@ fn guess_image_mime(url: &str, bytes: &[u8]) -> String {
     }
 }
 
-/// Run `op`, retrying on error with exponential backoff (2s, 4s, 8s…).
+/// Whether an error is the server telling us to slow down or go away (rate limiting /
+/// bot protection), rather than a transient network failure.
+fn is_throttle_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<reqwest::Error>()
+        .and_then(|re| re.status())
+        .map(|s| matches!(s.as_u16(), 403 | 408 | 429 | 503))
+        .unwrap_or(false)
+}
+
+/// Run `op`, retrying on error with exponential backoff. Ordinary failures back off
+/// 2s/4s/8s; rate-limit responses (403/408/429/503) back off much longer (20s/40s/80s) —
+/// hammering a throttling server just extends the block.
 fn with_retry<T, F>(progress: &Progress, url: &str, mut op: F) -> Result<T>
 where
     F: FnMut() -> Result<T>,
@@ -180,9 +221,10 @@ where
         match op() {
             Ok(v) => return Ok(v),
             Err(e) if attempt < MAX_ATTEMPTS => {
-                let backoff = 2u64.pow(attempt);
+                let base: u64 = if is_throttle_error(&e) { 10 } else { 1 };
+                let backoff = base * 2u64.pow(attempt);
                 progress.verbose(&format!(
-                    "Request to {} failed (attempt {}/{}): {}. Retrying in {}s…",
+                    "Request to {} failed (attempt {}/{}): {:#}. Retrying in {}s…",
                     url, attempt, MAX_ATTEMPTS, e, backoff
                 ));
                 thread::sleep(Duration::from_secs(backoff));

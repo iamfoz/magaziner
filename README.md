@@ -148,6 +148,15 @@ includes the issue's cover, every listed article/essay/reading (with bylines and
 artwork embedded in the article body), and an **"Artwork from this Issue"** gallery built
 from the issue page's photograph slideshow, with captions.
 
+Harper's rate-limits bursts of requests partway through an issue. magaziner handles
+this automatically — rate-limit responses get long backoffs (20s/40s/80s), and any
+articles that still fail are retried sequentially after a 60-second cooldown — but if
+you see many failures, lowering the load helps:
+
+```bash
+magaziner --url https://harpers.org/archive/2026/05/ --concurrency 2 --delay 5000
+```
+
 Harper's metered paywall counts reads via browser cookies. magaziner holds no cookie
 jar, so each request arrives like a fresh private-browsing window and the meter never
 accumulates — no subscription is needed for metered content. If you have a subscription

@@ -147,11 +147,17 @@ impl MagazineAdapter for HarpersAdapter {
             })
             .unwrap_or_else(|| "Untitled".into());
 
-        let body = doc
+        let mut body = doc
             .select(&body_selector)
             .map(|el| strip_chrome(el.inner_html(), &el))
             .collect::<Vec<_>>()
             .join("\n\n");
+
+        // The article's lead image (the WordPress featured image) sits in the article
+        // header, OUTSIDE entry-content — prepend it so it isn't lost.
+        if let Some(lead) = extract_lead_image(doc, &body_selector, &body) {
+            body = format!("{}\n{}", lead, body);
+        }
 
         let byline = extract_byline(doc);
 
@@ -317,6 +323,61 @@ fn extract_artwork(doc: &Html, progress: &Progress) -> Vec<ArticleData> {
         byline: None,
         body: figures,
     }]
+}
+
+/// Find the article's lead image — a WordPress attachment image (`class="wp-image-…"`)
+/// that is NOT inside the entry-content body — and render it as a figure to prepend to
+/// the body. Its caption is resolved through `aria-describedby` (the standard WP
+/// `caption-attachment-<id>` element). Returns `None` when there is no lead image or the
+/// body already contains the same file (no duplication).
+fn extract_lead_image(doc: &Html, body_sel: &Selector, body: &str) -> Option<String> {
+    let img_sel = Selector::parse(r#"img[class*="wp-image-"]"#).unwrap();
+    let body_ids: Vec<_> = doc.select(body_sel).map(|el| el.id()).collect();
+
+    let img = doc.select(&img_sel).find(|img| {
+        !img.ancestors().any(|n| body_ids.contains(&n.id()))
+    })?;
+
+    let src = img
+        .value()
+        .attr("src")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| img.value().attr("data-src"))
+        .map(|s| absolutize(BASE, s.trim()))
+        .filter(|s| is_valid_http_url(s))?;
+    if body.contains(src.as_str()) {
+        return None;
+    }
+
+    let srcset_attr = img
+        .value()
+        .attr("srcset")
+        .map(|s| format!(" srcset=\"{}\"", esc_attr(s)))
+        .unwrap_or_default();
+    let alt = img.value().attr("alt").unwrap_or("");
+
+    let caption = img
+        .value()
+        .attr("aria-describedby")
+        .and_then(|id| Selector::parse(&format!(r#"[id="{}"]"#, id)).ok())
+        .and_then(|sel| doc.select(&sel).next())
+        .map(|el| flatten_caption(&el.inner_html()))
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("<figcaption>{}</figcaption>", c))
+        .unwrap_or_default();
+
+    Some(format!(
+        "<figure class=\"lead-image\"><img src=\"{}\"{} alt=\"{}\"/>{}</figure>",
+        esc_attr(&src),
+        srcset_attr,
+        esc_attr(alt),
+        caption
+    ))
+}
+
+/// Minimal attribute escaping for HTML we synthesize ourselves.
+fn esc_attr(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;")
 }
 
 /// Flatten a slideshow caption's markup: the raw HTML is nested in PDF-export div soup
@@ -493,6 +554,58 @@ mod tests {
         let progress = Progress::new(Verbosity::Quiet);
         let article = HarpersAdapter.extract_article(&doc, &progress);
         assert_eq!(article.byline.as_deref(), Some("Samuel Moyn"));
+    }
+
+    #[test]
+    fn test_article_lead_image_prepended_with_caption() {
+        let doc = load_html_fixture("src/test/harpers/article.html");
+        let progress = Progress::new(Verbosity::Quiet);
+        let article = HarpersAdapter.extract_article(&doc, &progress);
+
+        let lead_pos = article
+            .body
+            .find("CUT-19-scaled-e1775676184537-1124x820.jpg")
+            .expect("lead image should be prepended to the body");
+        let body_text_pos = article
+            .body
+            .find("synthetic article body")
+            .expect("body text present");
+        assert!(
+            lead_pos < body_text_pos,
+            "Lead image must come before the article text"
+        );
+        assert!(
+            article.body.contains("Illustrations by Matt Rota</figcaption>")
+                || article
+                    .body
+                    .contains("<figcaption>Illustrations by Matt Rota"),
+            "Lead image caption should be attached: {}",
+            article.body
+        );
+        // The srcset rides along so the EPUB embedder can pick the 2048w rendition.
+        assert!(
+            article.body.contains("2048w"),
+            "Lead image srcset should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_lead_image_not_duplicated_when_already_in_body() {
+        let html = r#"<html><body>
+          <img class="wp-image-1 size-large" src="https://wp.harpers.org/w.jpg" alt="">
+          <div class="wysiwyg-content entry-content">
+            <p>Text</p><img class="wp-image-1" src="https://wp.harpers.org/w.jpg" alt="">
+          </div>
+        </body></html>"#;
+        let doc = Html::parse_document(html);
+        let progress = Progress::new(Verbosity::Quiet);
+        let article = HarpersAdapter.extract_article(&doc, &progress);
+        assert_eq!(
+            article.body.matches("https://wp.harpers.org/w.jpg").count(),
+            1,
+            "The same file must not appear twice: {}",
+            article.body
+        );
     }
 
     #[test]
